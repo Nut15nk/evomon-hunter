@@ -1,0 +1,17 @@
+# ---- ไฟล์ส่วนตัวของแต่ละเครื่อง (updater ก็ไม่แตะ) ----
+history.json
+normals.json
+config_user.py
+start.bat.new
+
+# ---- python ----
+__pycache__/
+*.pyc
+
+# ---- ภาพหน้าจอ/ไฟล์ทดสอบ ไม่ต้องแจก (template ที่ใช้จริง whitelist ข้างล่าง) ----
+*.png
+*.webp
+!monster_lv.png
+!battle_time.png
+!obtain_panel.png
+!templates/**/*.png

@@ -1,0 +1,7 @@
+opencv-python
+numpy
+mss
+pydirectinput
+keyboard
+rapidocr-onnxruntime
+onnxruntime==1.18.1
