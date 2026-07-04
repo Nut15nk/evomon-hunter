@@ -13,8 +13,15 @@ if %errorlevel% neq 0 (
 REM === Go to this script's folder ===
 cd /d "%~dp0"
 
+REM === Use bundled portable Python if present (portable zip = no installs needed) ===
+if exist "%~dp0python\python.exe" (
+    set "PYCMD="%~dp0python\python.exe""
+) else (
+    set "PYCMD=py -3.12"
+)
+
 REM === Auto-update from GitHub (skips quietly when offline) ===
-if exist update.py py -3.12 update.py
+if exist update.py %PYCMD% update.py
 
 REM === update.py can't overwrite this running script -> swap and restart ===
 if exist "start.bat.new" (
@@ -25,16 +32,16 @@ if exist "start.bat.new" (
 )
 
 REM === Install dependencies on first run (if any lib missing) ===
-py -3.12 -c "import rapidocr_onnxruntime, customtkinter" 2>nul
+%PYCMD% -c "import rapidocr_onnxruntime, customtkinter" 2>nul
 if %errorlevel% neq 0 (
     echo [*] First run: installing dependencies...
-    py -3.12 -m pip install -r requirements.txt
+    %PYCMD% -m pip install -r requirements.txt
 )
 
-py -3.12 gui.py
+%PYCMD% gui.py
 if %errorlevel% neq 0 (
     echo.
-    echo [!] py -3.12 failed, trying python instead...
+    echo [!] failed, trying system python instead...
     python gui.py
 )
 

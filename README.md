@@ -122,7 +122,11 @@ CATCH   หน้า Catch:
 3. git add -A && git commit -m "..." && git push
 ```
 
-**ฝั่งเพื่อน (ครั้งแรกครั้งเดียว):** โหลด zip จากหน้า repo (ปุ่ม Code → Download ZIP) แตกไฟล์ แล้วดับเบิลคลิก `start.bat` — หลังจากนั้นได้อัพเดตเองตลอด
+**ฝั่งเพื่อน (ครั้งแรกครั้งเดียว) — เลือกทางใดทางหนึ่ง:**
+- **ง่ายสุด (ไม่ต้องลงอะไรเลย):** โหลด `evomon-hunter-portable.zip` จากหน้า [Releases](https://github.com/Nut15nk/evomon-hunter/releases) → แตกไฟล์ → ดับเบิลคลิก `start.bat` จบ (มี Python + ไลบรารีครบในตัว)
+- แบบเบา: โหลด zip จากปุ่ม Code → Download ZIP แต่ต้องลง [Python 3.12](https://www.python.org/downloads/) เองก่อน (ติ๊ก Add to PATH)
+
+หลังจากนั้นทั้งสองแบบได้อัพเดตโค้ดเองอัตโนมัติทุกครั้งที่เปิดเหมือนกัน
 
 ---
 

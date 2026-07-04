@@ -7,6 +7,7 @@ start.bat.new
 # ---- python ----
 __pycache__/
 *.pyc
+python/
 
 # ---- ภาพหน้าจอ/ไฟล์ทดสอบ ไม่ต้องแจก (template ที่ใช้จริง whitelist ข้างล่าง) ----
 *.png
