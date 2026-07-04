@@ -1,33 +1,55 @@
 # ===================================================================
-#  gui.py — หน้าต่างควบคุมบอท Evomon (Tkinter)
-#  รัน:  py -3.12 gui.py   (เปิด PowerShell แบบ Administrator ก่อน)
+#  gui.py — หน้าต่างควบคุมบอท Evomon (CustomTkinter — ธีมมืดโมเดิร์น)
+#  รัน:  py -3.12 gui.py   (เปิดผ่าน start.bat จะขอสิทธิ์ Admin ให้เอง)
 # ===================================================================
 
 import json
 import os
+import sys
 import time
 import threading
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    print("[!] ยังไม่มี customtkinter — รัน: py -3.12 -m pip install -r requirements.txt")
+    sys.exit(1)
 
 from bot import Bot
 import roblox
 import config
-from respath import userfile
+from respath import userfile, resource
 
 HISTORY_FILE = userfile("history.json")
 
-# ---- ธีมสี ----
-BG = "#15151f"
-PANEL = "#20202e"
-CARD = "#2a2a3c"
-TXT = "#e6e6f0"
-SUB = "#9aa0b4"
-ACCENT = "#7aa2f7"
-GREEN = "#39d353"
-RED = "#f85149"
-GOLD = "#ffd700"
-PURPLE = "#c792ea"
+# ---- โทนสี ----
+GREEN = "#2fbf5f"
+GREEN_HOVER = "#27a552"
+RED = "#e5484d"
+RED_HOVER = "#c93a3f"
+GOLD = "#f5c518"
+PURPLE = "#b18aff"
+BLUE = "#4f8df7"
+SUB = "#8b93a7"
+
+STATE_TH = {
+    "STOPPED": ("หยุดอยู่", SUB),
+    "RUNNING": ("เริ่มแล้ว", GREEN),
+    "SEARCH": ("กำลังหามอน...", BLUE),
+    "SEEK": ("เดินเข้าหามอน", BLUE),
+    "BATTLE": ("กำลังสู้", "#ff9f43"),
+    "CATCH": ("หน้า Catch", PURPLE),
+    "SHINY!": ("★ เจอ SHINY!", GOLD),
+    "PRISMATIC!": ("✦ เจอ PRISMATIC!", PURPLE),
+}
+
+
+def app_version():
+    try:
+        return open(resource("VERSION"), encoding="utf-8-sig").read().strip()
+    except OSError:
+        return "?"
 
 
 def load_history():
@@ -52,167 +74,183 @@ class App:
         self.root = root
         self.bot = Bot()
         self.history = load_history()
-        self.found_type = None
+        self.running = False
 
         root.title("Evomon Auto-Hunter")
-        root.geometry("760x880")
-        root.minsize(700, 800)
-        root.configure(bg=BG)
+        root.geometry("780x900")
+        root.minsize(700, 780)
 
-        self._style()
+        self.f_title = ctk.CTkFont("Segoe UI", 22, "bold")
+        self.f_head = ctk.CTkFont("Segoe UI", 14, "bold")
+        self.f_body = ctk.CTkFont("Segoe UI", 13)
+        self.f_small = ctk.CTkFont("Segoe UI", 11)
+        self.f_stat = ctk.CTkFont("Segoe UI", 24, "bold")
+        self.f_mono = ctk.CTkFont("Consolas", 12)
+
         self._build()
         self._refresh_history()
         self.root.after(80, self._poll)
         self.root.after(200, self._check_roblox)
 
-    def _style(self):
-        st = ttk.Style()
-        try:
-            st.theme_use("clam")
-        except Exception:
-            pass
-        st.configure("TNotebook", background=BG, borderwidth=0)
-        st.configure("TNotebook.Tab", background=PANEL, foreground=SUB,
-                     padding=(18, 8), font=("Segoe UI", 10, "bold"))
-        st.map("TNotebook.Tab", background=[("selected", CARD)],
-               foreground=[("selected", TXT)])
-
     # ================= layout =================
     def _build(self):
-        # ---------- Header (เห็นตลอด) ----------
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=12, pady=(12, 6))
+        # ---------- Header ----------
+        self.header = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.header.pack(fill="x", padx=16, pady=(14, 6))
 
-        self.btn_start = tk.Button(head, text="▶  เริ่ม", bg=GREEN, fg="black",
-                                   font=("Segoe UI", 12, "bold"), relief="flat",
-                                   width=10, command=self.on_start, cursor="hand2")
-        self.btn_start.pack(side="left")
-        self.btn_stop = tk.Button(head, text="■  หยุด", bg=RED, fg="white",
-                                  font=("Segoe UI", 12, "bold"), relief="flat",
-                                  width=10, command=self.on_stop, cursor="hand2")
-        self.btn_stop.pack(side="left", padx=8)
+        left = ctk.CTkFrame(self.header, fg_color="transparent")
+        left.pack(side="left")
+        ctk.CTkLabel(left, text="Evomon Auto-Hunter", font=self.f_title).pack(anchor="w")
+        ctk.CTkLabel(left, text=f"v{app_version()} • หา Shiny/Prismatic อัตโนมัติ",
+                     font=self.f_small, text_color=SUB).pack(anchor="w")
 
-        rs = tk.Frame(head, bg=BG)
-        rs.pack(side="right")
-        self.lbl_state = tk.Label(rs, text="STOPPED", bg=BG, fg=GOLD,
-                                  font=("Consolas", 14, "bold"))
-        self.lbl_state.pack(anchor="e")
-        self.lbl_rbx = tk.Label(rs, text="● Roblox: ...", bg=BG, fg=SUB,
-                                font=("Segoe UI", 9))
-        self.lbl_rbx.pack(anchor="e")
+        self.lbl_rbx = ctk.CTkLabel(self.header, text="● Roblox: ...", font=self.f_small,
+                                    text_color=SUB, fg_color=("gray85", "gray17"),
+                                    corner_radius=14, padx=12, pady=6)
+        self.lbl_rbx.pack(side="right")
+
+        # ---------- ปุ่มใหญ่ + สถานะ ----------
+        ctrl = ctk.CTkFrame(self.root, corner_radius=16)
+        ctrl.pack(fill="x", padx=16, pady=6)
+
+        self.btn_main = ctk.CTkButton(ctrl, text="▶   เริ่มบอท", font=self.f_head,
+                                      height=52, width=200, corner_radius=12,
+                                      fg_color=GREEN, hover_color=GREEN_HOVER,
+                                      command=self.on_toggle)
+        self.btn_main.pack(side="left", padx=14, pady=14)
+
+        st = ctk.CTkFrame(ctrl, fg_color="transparent")
+        st.pack(side="left", padx=6)
+        ctk.CTkLabel(st, text="สถานะ", font=self.f_small,
+                     text_color=SUB).pack(anchor="w")
+        self.lbl_state = ctk.CTkLabel(st, text="หยุดอยู่", font=self.f_head,
+                                      text_color=SUB)
+        self.lbl_state.pack(anchor="w")
+
+        ctk.CTkLabel(ctrl, text="F8 = หยุดฉุกเฉิน\n(กดได้แม้อยู่ในเกม)",
+                     font=self.f_small, text_color=SUB,
+                     justify="right").pack(side="right", padx=14)
 
         # ---------- แถบแจ้งเตือนเจอ shiny/prismatic (ซ่อนไว้) ----------
-        self.shiny_box = tk.Frame(self.root, bg="#3a2e10",
-                                  highlightbackground=GOLD, highlightthickness=2)
-        self.lbl_shiny = tk.Label(self.shiny_box, bg="#3a2e10", fg=TXT,
-                                  font=("Segoe UI", 12, "bold"), justify="left")
-        self.lbl_shiny.pack(anchor="w", padx=10, pady=(8, 2))
-        bf = tk.Frame(self.shiny_box, bg="#3a2e10")
-        bf.pack(fill="x", padx=8, pady=(0, 8))
-        tk.Button(bf, text="▶ เริ่มต่อ (ไปจัดการในเกมแล้ว)", bg=ACCENT, fg="black",
-                  relief="flat", font=("Segoe UI", 10, "bold"), cursor="hand2",
-                  command=lambda: self.resolve("continue")).pack(side="left", padx=3)
-        tk.Button(bf, text="ปิดแจ้งเตือน", bg=SUB, fg="black", relief="flat",
-                  font=("Segoe UI", 10, "bold"), cursor="hand2",
-                  command=self._hide_shiny).pack(side="left", padx=3)
+        self.alert = ctk.CTkFrame(self.root, corner_radius=14,
+                                  border_width=2, border_color=GOLD)
+        self.lbl_alert = ctk.CTkLabel(self.alert, text="", font=self.f_head,
+                                      text_color=GOLD, justify="left")
+        self.lbl_alert.pack(anchor="w", padx=14, pady=(12, 4))
+        arow = ctk.CTkFrame(self.alert, fg_color="transparent")
+        arow.pack(anchor="w", padx=14, pady=(0, 12))
+        ctk.CTkButton(arow, text="▶ ล่าต่อ (จัดการในเกมแล้ว)", font=self.f_body,
+                      corner_radius=10, command=lambda: self.resolve("continue")
+                      ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(arow, text="ปิดแจ้งเตือน", font=self.f_body, corner_radius=10,
+                      fg_color="transparent", border_width=1, border_color=SUB,
+                      text_color=SUB, hover_color=("gray80", "gray25"),
+                      command=self._hide_alert).pack(side="left")
 
-        # ---------- Notebook ----------
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=12, pady=8)
-        self.tab_ctrl = tk.Frame(nb, bg=BG)
-        self.tab_hist = tk.Frame(nb, bg=BG)
-        self.tab_log = tk.Frame(nb, bg=BG)
-        nb.add(self.tab_ctrl, text="ตั้งค่า")
-        nb.add(self.tab_hist, text="ประวัติ")
-        nb.add(self.tab_log, text="Log")
+        # ---------- การ์ดตัวเลข ----------
+        stats = ctk.CTkFrame(self.root, fg_color="transparent")
+        stats.pack(fill="x", padx=16, pady=6)
+        stats.grid_columnconfigure((0, 1, 2), weight=1, uniform="s")
+        self.stat_mob = self._stat_card(stats, 0, "เจอมอนรอบนี้", "0", GREEN)
+        self.stat_shiny = self._stat_card(stats, 1, "★ Shiny สะสม", "0", GOLD)
+        self.stat_pris = self._stat_card(stats, 2, "✦ Prismatic สะสม", "0", PURPLE)
 
-        self._build_ctrl(self.tab_ctrl)
-        self._build_hist(self.tab_hist)
-        self._build_log(self.tab_log)
+        # ---------- แท็บ ----------
+        self.tabs = ctk.CTkTabview(self.root, corner_radius=16,
+                                   segmented_button_selected_color=BLUE)
+        self.tabs.pack(fill="both", expand=True, padx=16, pady=(6, 14))
+        t_set = self.tabs.add("  ตั้งค่า  ")
+        t_hist = self.tabs.add("  ประวัติ  ")
+        t_log = self.tabs.add("  Log  ")
+        self._build_settings(t_set)
+        self._build_hist(t_hist)
+        self._build_log(t_log)
 
-        tk.Label(self.root, text="F8 = หยุดฉุกเฉิน (กดได้แม้อยู่ในเกม)",
-                 bg=BG, fg="#666").pack(pady=(0, 6))
+    def _stat_card(self, parent, col, title, value, color):
+        c = ctk.CTkFrame(parent, corner_radius=14)
+        c.grid(row=0, column=col, sticky="nsew", padx=4)
+        ctk.CTkLabel(c, text=title, font=self.f_small,
+                     text_color=SUB).pack(anchor="w", padx=14, pady=(10, 0))
+        lbl = ctk.CTkLabel(c, text=value, font=self.f_stat, text_color=color)
+        lbl.pack(anchor="w", padx=14, pady=(0, 10))
+        return lbl
 
     def _card(self, parent, title):
-        c = tk.LabelFrame(parent, text="  " + title + "  ", bg=CARD, fg=ACCENT,
-                          font=("Segoe UI", 10, "bold"), relief="flat", bd=0)
-        c.pack(fill="x", padx=10, pady=7, ipady=2)
+        c = ctk.CTkFrame(parent, corner_radius=14)
+        c.pack(fill="x", padx=8, pady=6)
+        ctk.CTkLabel(c, text=title, font=self.f_head).pack(anchor="w",
+                                                           padx=14, pady=(10, 2))
         return c
 
-    def _build_ctrl(self, p):
+    def _build_settings(self, p):
         # --- สกิล ---
-        sk = self._card(p, "สกิล (กดเป็นตัวเลข ใช้ได้ทุกตัวละคร)")
-        row = tk.Frame(sk, bg=CARD)
-        row.pack(anchor="w", padx=8, pady=6)
-        tk.Label(row, text="สกิลหลักที่วนกด:", bg=CARD, fg=TXT).pack(side="left")
-        self.var_skill = tk.StringVar(value=self.bot.settings.primary_skill)
-        for s in ("1", "2", "3"):
-            tk.Radiobutton(row, text=s, variable=self.var_skill, value=s,
-                           bg=CARD, fg=TXT, selectcolor="#3a3a50",
-                           activebackground=CARD, font=("Segoe UI", 10, "bold"),
-                           command=self.on_settings).pack(side="left", padx=6)
+        sk = self._card(p, "สกิล")
+        row = ctk.CTkFrame(sk, fg_color="transparent")
+        row.pack(anchor="w", padx=14, pady=(2, 6))
+        ctk.CTkLabel(row, text="สกิลหลักที่วนกด:", font=self.f_body).pack(side="left",
+                                                                          padx=(0, 10))
+        self.seg_skill = ctk.CTkSegmentedButton(row, values=["1", "2", "3"],
+                                                font=self.f_body,
+                                                command=lambda _: self.on_settings())
+        self.seg_skill.set(self.bot.settings.primary_skill)
+        self.seg_skill.pack(side="left")
 
-        self.var_s4 = tk.BooleanVar(value=self.bot.settings.use_skill4)
-        tk.Checkbutton(sk, text="กดสกิล 4 อัตโนมัติด้วย (เมื่อพร้อม)",
-                       variable=self.var_s4, bg=CARD, fg=TXT, selectcolor="#3a3a50",
-                       activebackground=CARD, command=self.on_settings).pack(
-            anchor="w", padx=8, pady=(0, 6))
+        self.sw_s4 = ctk.CTkSwitch(sk, text="กดสกิล 4 อัตโนมัติด้วย (เมื่อพร้อม)",
+                                   font=self.f_body, command=self.on_settings)
+        if self.bot.settings.use_skill4:
+            self.sw_s4.select()
+        self.sw_s4.pack(anchor="w", padx=14, pady=(2, 12))
 
-        # --- กล้อง/หน้าต่าง ---
+        # --- กล้อง & หน้าต่าง ---
         cam = self._card(p, "กล้อง & หน้าต่าง")
-        self.var_cam = tk.BooleanVar(value=self.bot.settings.camera_on_start)
-        tk.Checkbutton(cam, text="ตั้งมุมกล้องอัตโนมัติ + ล็อกมุม (ตัวอยู่กลางจอ)",
-                       variable=self.var_cam, bg=CARD, fg=TXT, selectcolor="#3a3a50",
-                       activebackground=CARD, command=self.on_settings).pack(
-            anchor="w", padx=8, pady=(4, 0))
-        self.var_focus = tk.BooleanVar(value=self.bot.settings.force_focus)
-        tk.Checkbutton(cam, text="บังคับให้อยู่หน้าต่าง Roblox ตลอด (สับจอแล้วดึงกลับ)",
-                       variable=self.var_focus, bg=CARD, fg=TXT, selectcolor="#3a3a50",
-                       activebackground=CARD, command=self.on_settings).pack(
-            anchor="w", padx=8)
-        tk.Button(cam, text="🎥 ตั้งมุมกล้องเดี๋ยวนี้", bg=ACCENT, fg="black",
-                  relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2",
-                  command=self.on_camera).pack(anchor="w", padx=8, pady=8)
+        self.sw_cam = ctk.CTkSwitch(cam, text="ตั้งมุมกล้องอัตโนมัติ + ล็อกมุม (ตัวอยู่กลางจอ)",
+                                    font=self.f_body, command=self.on_settings)
+        if self.bot.settings.camera_on_start:
+            self.sw_cam.select()
+        self.sw_cam.pack(anchor="w", padx=14, pady=2)
+        self.sw_focus = ctk.CTkSwitch(cam, text="บังคับให้อยู่หน้าต่าง Roblox ตลอด (สลับจอแล้วดึงกลับ)",
+                                      font=self.f_body, command=self.on_settings)
+        if self.bot.settings.force_focus:
+            self.sw_focus.select()
+        self.sw_focus.pack(anchor="w", padx=14, pady=2)
+        ctk.CTkButton(cam, text="🎥  ตั้งมุมกล้องเดี๋ยวนี้", font=self.f_body,
+                      corner_radius=10, fg_color="transparent", border_width=1,
+                      border_color=BLUE, text_color=BLUE,
+                      hover_color=("gray80", "gray25"),
+                      command=self.on_camera).pack(anchor="w", padx=14, pady=(8, 12))
 
-        # --- สถานะ ---
-        info = self._card(p, "สถานะ")
-        self.lbl_catch = tk.Label(info, text="เจอมอน: 0 ตัว", bg=CARD, fg=GREEN,
-                                  font=("Segoe UI", 10))
-        self.lbl_catch.pack(anchor="w", padx=8, pady=(4, 0))
-        tk.Label(info, text="ไม่จับเอง (ไม่กด E) — สู้เสร็จก็เดินหาตัวต่อไป\n"
-                            "ตรวจ shiny/prismatic จากแผง Obtain Rate (ซ้ายล่าง) เจอแล้วหยุด + แจ้งเตือน",
-                 bg=CARD, fg=SUB, font=("Segoe UI", 9), justify="left",
-                 wraplength=680).pack(anchor="w", padx=8, pady=(0, 6))
+        # --- วิธีทำงาน ---
+        info = self._card(p, "บอททำอะไรให้บ้าง")
+        ctk.CTkLabel(
+            info, font=self.f_small, text_color=SUB, justify="left", wraplength=640,
+            text="เดินหามอน → สู้อัตโนมัติ → ไม่จับเอง (ไม่กด E) → หาตัวต่อไปวนไปเรื่อยๆ\n"
+                 "เจอ Shiny/Prismatic เมื่อไร: หยุดทันที + เสียงเตือน + เด้งแจ้งเตือน "
+                 "ให้คุณเข้าไปจัดการในเกมเอง").pack(anchor="w", padx=14, pady=(0, 12))
 
     def _build_hist(self, p):
-        tk.Label(p, text="ตัวที่ได้ (Shiny / Prismatic)", bg=BG, fg=SUB,
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
-        self.hist_list = tk.Listbox(p, bg="#12121c", fg=TXT, font=("Consolas", 10),
-                                    relief="flat", highlightthickness=0,
-                                    selectbackground=CARD)
-        self.hist_list.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.hist_frame = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        self.hist_frame.pack(fill="both", expand=True, padx=4, pady=4)
 
     def _build_log(self, p):
-        self.log = scrolledtext.ScrolledText(p, bg="#0e0e16", fg="#cdd6f4",
-                                             font=("Consolas", 9), relief="flat",
-                                             highlightthickness=0)
-        self.log.pack(fill="both", expand=True, padx=12, pady=12)
+        self.log = ctk.CTkTextbox(p, font=self.f_mono, corner_radius=10,
+                                  state="disabled", wrap="word")
+        self.log.pack(fill="both", expand=True, padx=4, pady=4)
 
     # ================= actions =================
     def on_settings(self):
         s = self.bot.settings
-        s.primary_skill = self.var_skill.get()
-        s.use_skill4 = self.var_s4.get()
-        s.camera_on_start = self.var_cam.get()
-        s.force_focus = self.var_focus.get()
+        s.primary_skill = self.seg_skill.get()
+        s.use_skill4 = bool(self.sw_s4.get())
+        s.camera_on_start = bool(self.sw_cam.get())
+        s.force_focus = bool(self.sw_focus.get())
 
-    def on_start(self):
-        self.on_settings()
-        self._hide_shiny()
-        self.bot.start()
-
-    def on_stop(self):
-        self.bot.stop()
+    def on_toggle(self):
+        if self.running:
+            self.bot.stop()
+        else:
+            self.on_settings()
+            self._hide_alert()
+            self.bot.start()
 
     def on_camera(self):
         self.on_settings()
@@ -220,49 +258,88 @@ class App:
 
     def resolve(self, choice):
         if choice == "continue":
-            self._hide_shiny()
+            self._hide_alert()
             self.bot.start()
 
     # ================= helpers =================
+    def _set_running(self, running):
+        self.running = running
+        if running:
+            self.btn_main.configure(text="■   หยุดบอท", fg_color=RED,
+                                    hover_color=RED_HOVER)
+        else:
+            self.btn_main.configure(text="▶   เริ่มบอท", fg_color=GREEN,
+                                    hover_color=GREEN_HOVER)
+
+    def _set_state(self, raw):
+        th, color = STATE_TH.get(raw, (raw, SUB))
+        self.lbl_state.configure(text=th, text_color=color)
+        if raw == "RUNNING":
+            self._set_running(True)
+        elif raw == "STOPPED":
+            self._set_running(False)
+
     def _show_found(self, ftype):
         """เจอ shiny/prismatic -> บันทึกประวัติอัตโนมัติ + เด้งแจ้งเตือน (บอทหยุดแล้ว)"""
-        self.found_type = ftype
-        self.history.insert(0, {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "type": ftype})
+        self.history.insert(0, {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "type": ftype})
         save_history(self.history)
         self._refresh_history()
         self._append_log(f"[★] เจอ {ftype.upper()} -> บันทึกประวัติแล้ว, บอทหยุด")
         label = "★ SHINY!" if ftype == "shiny" else "✦ PRISMATIC!"
-        self.lbl_shiny.config(
+        color = GOLD if ftype == "shiny" else PURPLE
+        self.lbl_alert.configure(
             text=f"{label}  เจอแล้ว — บอทหยุด + ไม่กด E\n"
-                 f"ไปจัดการในเกมได้เลย (บันทึกประวัติให้แล้ว)")
-        self.shiny_box.pack(fill="x", padx=12, pady=4, after=self.root.winfo_children()[0])
+                 f"ไปจัดการในเกมได้เลย (บันทึกประวัติให้แล้ว)", text_color=color)
+        self.alert.configure(border_color=color)
+        self.alert.pack(fill="x", padx=16, pady=6, after=self.header)
+        self.root.deiconify()
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
 
-    def _hide_shiny(self):
-        self.found_type = None
-        self.shiny_box.pack_forget()
+    def _hide_alert(self):
+        self.alert.pack_forget()
 
     def _refresh_history(self):
-        self.hist_list.delete(0, "end")
+        for w in self.hist_frame.winfo_children():
+            w.destroy()
+        shiny = sum(1 for it in self.history if it["type"] == "shiny")
+        pris = sum(1 for it in self.history if it["type"] == "prismatic")
+        self.stat_shiny.configure(text=str(shiny))
+        self.stat_pris.configure(text=str(pris))
+
         if not self.history:
-            self.hist_list.insert("end", "  (ยังไม่มี)")
+            ctk.CTkLabel(self.hist_frame, text="ยังไม่เจอ Shiny/Prismatic เลย — สู้ๆ!",
+                         font=self.f_body, text_color=SUB).pack(pady=20)
+            return
         for it in self.history:
-            self.hist_list.insert(
-                "end", f"  {it['type'].upper():10s} {it['time']}")
+            row = ctk.CTkFrame(self.hist_frame, corner_radius=10)
+            row.pack(fill="x", pady=3, padx=4)
+            is_shiny = it["type"] == "shiny"
+            ctk.CTkLabel(row, text="★ SHINY" if is_shiny else "✦ PRISMATIC",
+                         font=self.f_head, width=130, anchor="w",
+                         text_color=GOLD if is_shiny else PURPLE
+                         ).pack(side="left", padx=(12, 6), pady=8)
+            ctk.CTkLabel(row, text=it["time"], font=self.f_mono,
+                         text_color=SUB).pack(side="left")
 
     def _append_log(self, msg):
+        self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
         self.log.see("end")
+        self.log.configure(state="disabled")
 
     # ================= polling =================
     def _check_roblox(self):
         try:
             if roblox.is_running(config.ROBLOX_PROCESS):
                 if roblox.is_foreground(config.ROBLOX_PROCESS):
-                    self.lbl_rbx.config(text="● Roblox: พร้อม", fg=GREEN)
+                    self.lbl_rbx.configure(text="●  Roblox: พร้อม", text_color=GREEN)
                 else:
-                    self.lbl_rbx.config(text="● Roblox: เปิดอยู่ (ยังไม่โฟกัส)", fg=GOLD)
+                    self.lbl_rbx.configure(text="●  Roblox: เปิดอยู่ (ยังไม่โฟกัส)",
+                                           text_color=GOLD)
             else:
-                self.lbl_rbx.config(text="● Roblox: ยังไม่เปิด", fg=RED)
+                self.lbl_rbx.configure(text="●  Roblox: ยังไม่เปิด", text_color=RED)
         except Exception:
             pass
         self.root.after(1500, self._check_roblox)
@@ -274,9 +351,9 @@ class App:
                 if kind == "log":
                     self._append_log(data)
                 elif kind == "state":
-                    self.lbl_state.config(text=data)
+                    self._set_state(data)
                 elif kind == "catch":
-                    self.lbl_catch.config(text=f"เจอมอน: {data} ตัว")
+                    self.stat_mob.configure(text=str(data))
                 elif kind == "found":
                     self._show_found(data)
         except Exception:
@@ -285,7 +362,9 @@ class App:
 
 
 def main():
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     App(root)
     root.mainloop()
 

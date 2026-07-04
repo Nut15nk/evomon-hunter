@@ -24,8 +24,8 @@ if exist "start.bat.new" (
     exit /b
 )
 
-REM === Install dependencies on first run (if OCR lib missing) ===
-py -3.12 -c "import rapidocr_onnxruntime" 2>nul
+REM === Install dependencies on first run (if any lib missing) ===
+py -3.12 -c "import rapidocr_onnxruntime, customtkinter" 2>nul
 if %errorlevel% neq 0 (
     echo [*] First run: installing dependencies...
     py -3.12 -m pip install -r requirements.txt

@@ -41,7 +41,7 @@ def fetch(url):
 
 def local_version():
     try:
-        return open(os.path.join(APP, "VERSION"), encoding="utf-8").read().strip()
+        return open(os.path.join(APP, "VERSION"), encoding="utf-8-sig").read().strip()
     except OSError:
         return "0"
 
