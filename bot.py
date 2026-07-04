@@ -5,9 +5,16 @@
 #    SEARCH : หามอน (ป้าย Lv.) ในจอ
 #       - ไม่เจอ -> หมุนกล้องกวาด + เดินนิด + ตั้งมุมกล้องใหม่เป็นพักๆ
 #       - เจอ   -> อ่านสี (แปลก=shiny หยุด) -> SEEK เดินเข้าหา
-#    SEEK   : ปรับทิศ w/a/s/d เดินเข้าหามอน จนเจอ "E Catch" หรือเข้า battle
-#    CATCH  : เจอปุ่ม "E Catch" -> กด E เอง
-#    BATTLE : เจอป้าย TIME -> วนกดสกิล(เลข) จนจบ -> ลองจับ (E) อีกที
+#    SEEK   : หมุนกล้อง (yaw) เล็งไปที่มอนก่อน พอเล็งตรงแล้วกด "w" เดินเข้าหา
+#             จนเจอ battle/catch
+#    ENGAGE : เข้าสู้/หน้า catch แล้ว -> "รอเฉยๆ" ให้ Auto Skill / Auto Catch
+#             ที่มีอยู่แล้วในเกมจัดการเอง (บอทไม่กดสกิล ไม่กด E)
+#             ถ้าเจอ shiny/prismatic -> หยุดทันที + แจ้งเตือนให้คนจัดการเอง
+#
+#  หมายเหตุ: เธรดตรวจภาพยิงตรวจจับ Lv./ผู้เล่น/battle/panel "พร้อมกัน" ผ่าน
+#  vision.detect_all() (multi-thread) แต่ถูกจำกัดอัตราไว้ที่ config.DETECT_FPS
+#  (ดีฟอลต์ 10 ครั้ง/วิ) กันเธรดตรวจภาพยิงถี่จนซีพียูโหลดเกิน/ค้าง
+#  ค่านี้คุมแค่ "ความถี่การตรวจจับ" เท่านั้น ไม่เกี่ยวกับตัวเลข FPS ที่โชว์บนจอ
 # ===================================================================
 
 import time
@@ -30,14 +37,25 @@ from respath import resource
 pydirectinput.PAUSE = 0
 pydirectinput.FAILSAFE = False
 
+# เกมมี Auto Skill / Auto Catch อยู่แล้ว -> บอทไม่ต้องกดสกิล/กด E เอง
+# เธรดตรวจภาพถูกจำกัดอัตราไว้ที่ config.DETECT_FPS (ดีฟอลต์ 10 ครั้ง/วิ)
+
+# ---- ค่าคุมการ "หันกล้องเข้าหาเป้าหมาย" ตอน SEEK (เดาไว้ก่อน ยังไม่มีใน config.py) ----
+# SEEK_TURN_GAIN : พิกเซล dx บนจอ -> แปลงเป็นระยะลากเมาส์ yaw เท่าไหร่ต่อ 1 พิกเซล
+# SEEK_TURN_MAX  : ลากเมาส์ yaw ต่อ 1 ครั้งได้มากสุดกี่พิกเซล (กันหันพรวดเดียวเลยเป้า)
+SEEK_TURN_GAIN = getattr(config, "SEEK_TURN_GAIN", 0.06)
+SEEK_TURN_MAX = getattr(config, "SEEK_TURN_MAX", 25)
+# อัตราตรวจจับของเธรด detector (ครั้ง/วิ) -- getattr กันพังถ้า config.py ยังไม่มีค่านี้
+DETECT_FPS = getattr(config, "DETECT_FPS", 10)
+# ปุ่มบังคับ fullscreen ตอนเริ่ม -- getattr กันพัง ถ้า config.py เวอร์ชันเก่ายังไม่มีค่านี้
+FULLSCREEN_KEY = getattr(config, "FULLSCREEN_KEY", "f11")
+
 
 class Settings:
     def __init__(self):
-        self.primary_skill = config.PRIMARY_SKILL
-        self.use_skill4 = config.USE_SKILL4
-        self.skill_interval = config.SKILL_INTERVAL
         self.force_focus = config.FORCE_FOCUS
         self.camera_on_start = config.CAMERA_ON_START
+        self.fullscreen_on_start = getattr(config, "FULLSCREEN_ON_START", True)
 
 
 class Bot:
@@ -47,30 +65,43 @@ class Bot:
         self.lv_tpl = None
         self.battle_tpl = None
         self.panel_tpl = None       # กล่อง "Obtain Rate" (gate ว่าอยู่หน้า Catch)
+        self.player_tpl = None      # ป้ายชื่อตัวเอง (anchor) — ไม่มีไฟล์ = ใช้กลางจอแทน
         self._thread = None
         self._det_thread = None     # เธรดตรวจภาพ (ทำงานแยกจากเธรดควบคุม)
         self._running = threading.Event()
         self._stop = threading.Event()
         self._held = set()          # ปุ่มที่กดค้างอยู่ตอนนี้ (กันปุ่มค้าง)
-        self.catch_count = 0        # ตัวนับ "เจอมอน" (ไม่ได้จับ แค่นับที่สู้/เจอ)
+        self.catch_count = 0        # ตัวนับ "เจอมอน" (เกม auto catch เอง บอทแค่นับ)
         self._rbx_ok = False
         self._rbx_last = 0.0
-        self._last_cam_fix = 0.0    # เวลาที่ล็อกมุมกล้องครั้งล่าสุด
-        self._skip_engage_until = 0.0  # หลังเจอตัวธรรมดา ข้าม engage ชั่วคราว (เดินออกไปหาตัวใหม่)
+        self._skip_engage_until = 0.0  # หลังเจอตัว/จบ engage ข้าม engage ชั่วคราว (เดินออกไปหาตัวใหม่)
         # ---- ผลตรวจภาพล่าสุด (เธรด detector เขียน, เธรด control อ่าน) ----
         self._plock = threading.Lock()
         self._percept = self._blank_percept()
+        # ---- เป้าที่ "ล็อก" อยู่ตอนนี้ (เธรด control เขียน, GUI อ่านไปวาด overlay) ----
+        self._tlock = threading.Lock()
+        self._locked_box = None
 
     @staticmethod
     def _blank_percept():
         return {"ts": 0.0, "W": 0, "H": 0, "engaged": False,
                 "in_battle": False, "catch": False, "obtain": None,
-                "lv_score": 0.0, "lv_box": None}
+                "lv_score": 0.0, "lv_box": None, "lv_targets": [],
+                "player_score": 0.0, "player_box": None}
 
     def _snap(self):
         """อ่านสำเนาผลตรวจภาพล่าสุดแบบ thread-safe"""
         with self._plock:
             return dict(self._percept)
+
+    def _set_locked(self, box):
+        with self._tlock:
+            self._locked_box = box
+
+    def get_locked(self):
+        """กล่องมอนที่บอท 'ล็อกเป้า' อยู่ตอนนี้ (None ถ้าไม่มี) -- ให้ GUI เอาไปวาด overlay"""
+        with self._tlock:
+            return self._locked_box
 
     def emit(self, kind, data=None):
         self.q.put((kind, data))
@@ -99,6 +130,14 @@ class Bot:
             if len(tpls) > 1:
                 self.log(f"[*] ใช้ template ป้าย Lv. {len(tpls)} แบบ")
             self.lv_tpl = tpls
+        if self.player_tpl is None:
+            p = resource(config.PLAYER_TEMPLATE)
+            if os.path.exists(p):
+                self.player_tpl = cv2.imread(p, cv2.IMREAD_COLOR)
+                self.log("[*] จับตำแหน่งตัวเองจากป้ายชื่อ (anchor เปิด)")
+            else:
+                self.log("[i] ไม่มี templates/player.png -> ยึดกลางจอแทน "
+                         "(ครอปป้ายชื่อด้วย make_template.py ได้)")
         for attr, name in [("battle_tpl", config.BATTLE_TEMPLATE),
                            ("panel_tpl", config.OBTAIN_PANEL_TEMPLATE)]:
             if getattr(self, attr) is None:
@@ -121,14 +160,15 @@ class Bot:
             self._percept = self._blank_percept()
         # อุ่นเครื่อง OCR ล่วงหน้า (โหลดโมเดลครั้งแรกช้า) ไม่ให้สะดุดตอนถึงหน้า Catch
         threading.Thread(target=ocr.warmup, daemon=True).start()
-        # เธรดตรวจภาพ: แคปจอ+ตรวจภาพวนรัวๆ อยู่เบื้องหลัง
+        # เธรดตรวจภาพ: แคปจอ+ตรวจภาพวนที่ config.DETECT_FPS (ดีฟอลต์ 10 ครั้ง/วิ) อยู่เบื้องหลัง
         self._det_thread = threading.Thread(target=self._detector_loop, daemon=True)
         self._det_thread.start()
-        # เธรดควบคุม: อ่านผลตรวจล่าสุดแล้วสั่งเดิน/สู้
+        # เธรดควบคุม: อ่านผลตรวจล่าสุดแล้วสั่งเดิน (ไม่กดสกิล/กด E เอง)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         self.emit("state", "RUNNING")
-        self.log("[*] เริ่มทำงาน (ตรวจภาพ+ควบคุม แยกเธรด)")
+        self.log(f"[*] เริ่มทำงาน (ตรวจภาพหลายอย่างพร้อมกัน ~{DETECT_FPS} FPS, "
+                 "หันกล้อง+เดินหาเอง / ปล่อย Auto Skill+Auto Catch ในเกมจัดการสู้-จับ)")
 
     def stop(self):
         self._stop.set()
@@ -225,59 +265,36 @@ class Bot:
         except Exception:
             pass
 
-    # ---------- กล้อง (ล็อกมุมคงที่: top-down หรือ มุมปกติตัวอยู่กลางจอ) ----------
+    # ---------- กล้อง ----------
     def _drag(self, dx, dy):
         pydirectinput.moveRel(dx, dy, relative=True)
 
-    def _tilt(self):
-        """ตั้งมุมกล้อง: ดันลงสุด (clamp) แล้วเงยขึ้นเยอะ -> มุมปกติ ตัวอยู่กลางจอ
-        (clamp ก่อนทุกครั้ง -> ได้องศาเดิมเป๊ะ ใช้ล็อกมุมกลับได้)"""
-        self._guard()                      # เช็คก่อนกดเมาส์ขวา (กันหลุดไปจออื่น)
-        s = config.CAMERA_TILT_SIGN
-        pydirectinput.mouseDown(button="right")
-        try:
-            time.sleep(0.04)
-            for _ in range(config.CAMERA_DOWN_STEPS):
-                self._guard()
-                self._drag(0, s * config.CAMERA_STEP_DY)
-                time.sleep(0.012)
-            for _ in range(config.CAMERA_UP_STEPS):
-                self._guard()
-                self._drag(0, -s * config.CAMERA_STEP_DY)
-                time.sleep(0.012)
-        finally:
-            pydirectinput.mouseUp(button="right")
-        self._last_cam_fix = time.time()
-
     def setup_camera(self):
+        """ซูมกล้องออกตอนเริ่มเท่านั้น -- ไม่ปรับมุมก้ม/เงย (pitch) อัตโนมัติแล้ว
+        เพราะทำให้กล้องหันเงยขึ้นฟ้าเอง มุมกล้องปล่อยตามที่ผู้เล่นตั้งเอง"""
         if not self._inputs_allowed():
             if not roblox.focus(config.ROBLOX_PROCESS):
                 self.log("[!] ตั้งกล้องไม่ได้ — เปิด/คลิกเข้า Roblox ก่อน")
                 return
             time.sleep(0.15)
-        self.log("[*] ตั้งมุมกล้อง: มุมปกติ (ตัวอยู่กลางจอ) ...")
+        self.log("[*] ซูมกล้องออก ...")
         try:
             for _ in range(config.CAMERA_ZOOM_PRESSES):
                 self._press(config.CAMERA_ZOOM_KEY)
                 time.sleep(0.03)
-            self._tilt()
             self.log("[*] ตั้งกล้องเสร็จ")
         except _Paused:
             self.log("[!] ตั้งกล้องไม่สำเร็จ (Roblox ไม่โฟกัส)")
 
-    def _reassert_camera(self):
+    def _turn_camera(self, dx_pixels):
+        """หมุนกล้อง (yaw) นิดๆ เข้าหาเป้าหมาย โดยไม่แตะมุมก้ม/เงย (pitch เดิม)"""
+        self._guard()
+        pydirectinput.mouseDown(button="right")
         try:
-            self._tilt()
-        except _Paused:
-            self._release_keys()
-
-    def _fix_camera_if_due(self):
-        """ล็อกมุมกล้องกลับองศาเดิมเป็นพักๆ (กันมุมเพี้ยน/ผู้เล่นหมุนกล้อง)
-        ทำเฉพาะตอนเปิดให้บอทคุมกล้อง (camera_on_start) เท่านั้น"""
-        if not self.settings.camera_on_start:
-            return
-        if time.time() - self._last_cam_fix >= config.CAMERA_FIX_EVERY:
-            self._reassert_camera()
+            self._drag(int(dx_pixels), 0)
+            time.sleep(0.02)
+        finally:
+            pydirectinput.mouseUp(button="right")
 
     def _scan_yaw(self, sign):
         self._guard()
@@ -305,12 +322,20 @@ class Bot:
                                  config.PANEL_SCALES) >= config.PANEL_THRESHOLD
 
     # ===================================================================
-    #  เธรดตรวจภาพ — แคปจอ+ตรวจภาพวนรัวๆ เก็บผลล่าสุด (ไม่กดปุ่มเอง)
-    #  เธรดควบคุมแค่ "อ่านผล" ไป สั่งเดิน/สู้ได้ทันที ไม่ต้องรอตรวจภาพ
+    #  เธรดตรวจภาพ — แคปจอ+ตรวจภาพ "พร้อมกันหลายอย่าง" (vision.detect_all,
+    #  multi-thread) โดยจำกัดอัตราไว้ที่ config.DETECT_FPS (ดีฟอลต์ 10 ครั้ง/วิ)
+    #  เธรดควบคุมแค่ "อ่านผล" ไปสั่งเดินได้ทันที ไม่ต้องรอตรวจภาพ
+    #
+    #  หมายเหตุ: DETECT_FPS คุมแค่ "ความถี่ที่เธรดนี้ตรวจจับ" เท่านั้น
+    #  ไม่ใช่ค่าที่เอาไปโชว์บน overlay หน้าจอ
     # ===================================================================
     def _detector_loop(self):
         sct = mss.mss()
+        prev_engaged = False   # เดาจากผลรอบก่อน กันหา Lv./ผู้เล่นทิ้งเปล่าตอน engaged
+        period = 1.0 / max(DETECT_FPS, 1)
         while not self._stop.is_set():
+            loop_start = time.time()
+
             if config.REQUIRE_ROBLOX and not self._roblox_running():
                 time.sleep(0.1)
                 continue
@@ -321,29 +346,48 @@ class Bot:
                 continue
 
             H, W = frame.shape[:2]
-            in_b = self._in_battle(frame)
-            catch = self._on_catch_screen(frame)        # เจอกล่อง Obtain Rate
+            # ยิงตรวจจับ Lv./ผู้เล่น/battle/panel พร้อมกันในเฟรมเดียว (multi-thread)
+            res = vision.detect_all(
+                frame, self.lv_tpl, self.player_tpl,
+                self.battle_tpl, self.panel_tpl,
+                config.BATTLE_SCALES, config.PANEL_SCALES,
+                need_target=not prev_engaged,
+            )
+            in_b = res["battle_score"] >= config.BATTLE_THRESHOLD
+            catch = res["panel_score"] >= config.PANEL_THRESHOLD
             # OCR แผง shiny/prismatic เฉพาะตอนอยู่หน้า Catch (rec-only เร็ว ~200ms)
             obtain = ocr.read_obtain(frame) if catch else None
             engaged = in_b or catch or bool(obtain)
-            # อยู่ในสู้/จับแล้วไม่ต้องหาป้าย Lv. (ประหยัดเวลา ตรวจไวขึ้น)
-            if engaged:
-                lv_score, lv_box = 0.0, None
-            else:
-                lv_score, lv_box, _ = vision.locate_lv(frame, self.lv_tpl)
+            prev_engaged = engaged
+
+            lv_score, lv_box = res["lv_score"], res["lv_box"]
+            pl_score, pl_box = res["player_score"], res["player_box"]
+            if pl_score < config.PLAYER_THRESHOLD:
+                pl_box = None
 
             with self._plock:
                 self._percept = {
                     "ts": time.time(), "W": W, "H": H, "engaged": engaged,
                     "in_battle": in_b, "catch": catch, "obtain": obtain,
                     "lv_score": lv_score, "lv_box": lv_box,
+                    "lv_targets": res.get("lv_targets", []),
+                    "player_score": pl_score, "player_box": pl_box,
                 }
+
+            # ---- จำกัดอัตราไว้ที่ ~DETECT_FPS ครั้ง/วิ ----
+            # ถ้ารอบนี้ (แคปจอ+ตรวจ+OCR) เร็วกว่า period ก็ sleep ส่วนที่เหลือ
+            # ถ้าช้ากว่า (เครื่องหนืด/OCR ช้า) ก็ปล่อยผ่านทันที ไม่สะสม backlog
+            elapsed = time.time() - loop_start
+            remaining = period - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     # ===================================================================
     #  ลูปหลัก (เธรดควบคุม)
     # ===================================================================
     def _loop(self):
         empty = 0
+        self.log(f"[*] ตรวจจับภาพด้วย: {vision.gpu_status_text()}")
 
         try:
             if self._wait_until_running():
@@ -353,10 +397,25 @@ class Bot:
                     if roblox.maximize(config.ROBLOX_PROCESS):
                         self.log("[*] ตั้ง Roblox เป็น Full Window (maximize)")
                     time.sleep(0.3)
+                if self.settings.fullscreen_on_start:
+                    try:
+                        self._press(FULLSCREEN_KEY)
+                        self.log(f"[*] กด {FULLSCREEN_KEY.upper()} บังคับ Fullscreen "
+                                 "(ถ้า Roblox fullscreen อยู่แล้วจะสลับกลับเป็น windowed แทน)")
+                    except _Paused:
+                        self.log("[!] กด Fullscreen ไม่สำเร็จ (Roblox ไม่โฟกัส)")
+                    except Exception as e:
+                        # กันพลาดจุดนี้แล้วลากทั้งเธรดตายไปด้วย (บอทจะไม่เดินหามอนเลย)
+                        self.log(f"[!] Fullscreen error (ข้ามไป ไม่กระทบส่วนอื่น): {e}")
+                    time.sleep(0.2)
                 if self.settings.camera_on_start:
                     self.setup_camera()
         except _Stop:
             pass
+        except Exception as e:
+            # กันไม่ให้ error ตอน setup (maximize/fullscreen/camera) ทำให้ทั้งลูปหลัก
+            # (หามอน/เดิน) ไม่ทำงานเลย -- log ไว้แล้วปล่อยให้ลูปหลักทำงานต่อ
+            self.log(f"[!] Setup error (ดำเนินการต่อ): {e}")
 
         try:
             while not self._stop.is_set():
@@ -369,7 +428,6 @@ class Bot:
                         raise _Stop
                     continue
                 try:
-                    self._fix_camera_if_due()      # ล็อกมุมกล้องกลับองศาเดิมเป็นพักๆ
                     empty = self._iteration(empty)
                 except _Paused:
                     self._release_keys()
@@ -401,12 +459,12 @@ class Bot:
             time.sleep(0.05)
             return empty
 
-        # หลังเจอตัวธรรมดา -> ข้าม engage ชั่วคราว (เดินออกไปหาตัวใหม่ ไม่วนเข้าจอ Catch เดิม)
+        # หลังจบ engage -> ข้าม engage ชั่วคราว (เดินออกไปหาตัวใหม่ ไม่วนเข้าจอเดิม)
         in_cooldown = time.time() < self._skip_engage_until
 
-        # อยู่หน้า battle/catch -> จัดการสู้ (ไม่จับ; หยุดเฉพาะ shiny/prismatic)
+        # อยู่หน้า battle/catch -> รอให้ Auto Skill/Auto Catch ในเกมจัดการเอง
         if p["engaged"] and not in_cooldown:
-            self._fight_and_catch()
+            self._handle_engage()
             return 0
 
         if p["lv_score"] >= config.MONSTER_THRESHOLD and not in_cooldown:
@@ -417,88 +475,147 @@ class Bot:
         # ไม่เจอ Lv. (หรือช่วง cooldown) -> หมุนกล้องกวาดหา จนกว่าจะเจอ
         self.emit("state", "SEARCH")
         empty += 1
-        self._fix_camera_if_due()                  # ล็อกมุมกล้องไว้องศาเดิม
         self._scan_yaw(1)                           # หมุนกล้องหา Lv.
         if empty % config.SCAN_WALK_EVERY == 0:      # เดินหน้านิดๆ เป็นพักๆ
             self._tap(config.SCAN_MOVE_KEY, config.SCAN_MOVE_DUR)
         return empty
 
-    # ---------- ค่อยๆ เดินเข้าหามอน (แตะ wasd ทีละก้าวแบบคน; ทิศมาจากเธรด detector) ----------
+    # ---------- เดินเข้าหามอนตามตำแหน่งที่ตรวจ (overlay) ชี้ไว้ ----------
+    # วิธี: "ตรวจจับก่อนเสมอ" แล้วค่อยขยับ -- แต่ละรอบอ่านตำแหน่งมอนล่าสุดก่อน
+    # ถ้ายังไม่เล็งตรงพอ (dx เกิน deadzone) จะหันกล้องอย่างเดียวก่อน ยังไม่ก้าวเดิน
+    # พอเล็งตรงแล้วค่อยก้าวเดิน 1 สเต็ป (แตะปุ่มค้างแล้วปล่อย = เดินแบบคน ไม่พุ่ง)
+    # สเต็ปยาวกว่าค่าตั้งต้นเดิม (STEP_HOLD) เพื่อให้ไปได้ไกลขึ้นต่อก้าว
+    #
+    # แต่ละเฟรมอาจเจอมอนหลายตัวพร้อมกัน (lv_targets) -- ฟังก์ชันนี้ "ล็อกเป้า"
+    # ไว้ตัวเดียวตั้งแต่ต้น (เลือกตัวที่ใกล้ตัวเราที่สุดก่อน) แล้วเดินเข้าหาตัวนั้น
+    # จนจบ (เข้าสู้ / หลุดเป้า / timeout) ไม่สลับไปมอนตัวอื่นระหว่างทางแม้เฟรมนั้น
+    # จะมีตัวอื่นคะแนนสูงกว่าก็ตาม -- พอจบ engage แล้วค่อยเลือกตัวถัดไปรอบใหม่
+    #
+    # หลุดเป้าแค่ "ชั่วคราว" (เฟรมสะดุด/โดนบังแป๊บเดียว) -- ยังไม่เลิกไล่ทันที แต่
+    # จะ "หยุดเดินรอ" จนกว่าจะเจอเป้าอีกครั้ง (ไม่เดินมั่วตอนไม่รู้ตำแหน่ง) ต้องหลุด
+    # ต่อเนื่องเกิน SEEK_LOST_MISS เฟรมถึงจะถือว่าหลุดจริงแล้วเลิกไล่
     def _seek_and_engage(self):
         self.emit("state", "SEEK")
         miss = 0
         last_ts = 0.0
-        key = None
+        move_key = None
         near = False
+        target = None    # (x,y,w,h) กล่องมอนที่ล็อกไว้ -- อัปเดตตำแหน่งได้ แต่ไม่สลับตัว
+        self._set_locked(None)
         t_end = time.time() + config.SEEK_TIMEOUT
-        while time.time() < t_end:
-            self._guard()
-            p = self._snap()
+        try:
+            while time.time() < t_end:
+                self._guard()
+                p = self._snap()
 
-            # ปรับทิศ/เช็คมอน "เฉพาะตอนมีผลตรวจเฟรมใหม่" (ไม่งั้นนับ miss มั่ว)
-            if p["ts"] != last_ts:
-                last_ts = p["ts"]
+                if p["ts"] != last_ts:
+                    last_ts = p["ts"]
 
-                if p["engaged"]:
-                    self._fight_and_catch()
-                    return
-
-                if p["lv_score"] < config.MONSTER_THRESHOLD:
-                    miss += 1
-                    if miss >= config.SEEK_LOST_MISS:
+                    if p["engaged"]:
+                        self._handle_engage()
                         return
-                    key = None
-                else:
-                    miss = 0
-                    box, W, H = p["lv_box"], p["W"], p["H"]
-                    cx = box[0] + box[2] // 2
-                    cy = box[1] + box[3] // 2 + int(box[2] * config.SEEK_BODY_DY)
-                    dx, dy = cx - W // 2, cy - H // 2
-                    near = max(abs(dx), abs(dy)) < config.SEEK_NEAR_DIST
 
-                    if abs(dx) < config.SEEK_DEADZONE and abs(dy) < config.SEEK_DEADZONE:
-                        key = "w"
-                    elif abs(dy) >= abs(dx):
-                        key = "w" if dy < 0 else "s"
+                    # มอนทั้งหมดที่เจอเฟรมนี้ (คะแนน >= threshold เท่านั้น)
+                    targets = [(sc, box) for sc, box in (p.get("lv_targets") or [])
+                               if box and sc >= config.MONSTER_THRESHOLD]
+                    if not targets and p["lv_box"] and p["lv_score"] >= config.MONSTER_THRESHOLD:
+                        targets = [(p["lv_score"], p["lv_box"])]   # เผื่อ lv_targets ว่าง (fallback)
+
+                    W, H = p["W"], p["H"]
+                    px, py = W // 2, H // 2
+                    if p["player_box"]:
+                        pb = p["player_box"]
+                        px = pb[0] + pb[2] // 2
+                        py = pb[1] + pb[3] // 2 + int(pb[2] * config.PLAYER_BODY_DY)
+
+                    picked = None
+                    if target is None:
+                        # ยังไม่ได้ล็อกเป้า -> เลือกตัวที่ "ใกล้ตัวเราที่สุด" ก่อน
+                        best_d = None
+                        for sc, tb in targets:
+                            tx, ty, tw, th = tb
+                            ccx = tx + tw / 2.0
+                            ccy = ty + th / 2.0 + int(tw * config.SEEK_BODY_DY)
+                            d = (ccx - px) ** 2 + (ccy - py) ** 2
+                            if best_d is None or d < best_d:
+                                best_d, picked = d, tb
                     else:
-                        key = "d" if dx > 0 else "a"
+                        # ล็อกเป้าไว้แล้ว -> หาให้ตรงกับ "ตัวเดิม" (จับคู่ตามตำแหน่งใกล้สุด)
+                        # กันสลับไปมอนตัวอื่นที่คะแนนสูงกว่าระหว่างเดิน
+                        tx0, ty0, tw0, th0 = target
+                        ccx0, ccy0 = tx0 + tw0 / 2.0, ty0 + th0 / 2.0
+                        best_d = None
+                        for sc, tb in targets:
+                            tx, ty, tw, th = tb
+                            ccx, ccy = tx + tw / 2.0, ty + th / 2.0
+                            d = (ccx - ccx0) ** 2 + (ccy - ccy0) ** 2
+                            max_jump = max(tw0, tw, 20) * 2.5
+                            if d < max_jump ** 2 and (best_d is None or d < best_d):
+                                best_d, picked = d, tb
 
-            # ก้าวทีละสเต็ป (กดสั้นๆ แล้วปล่อย + เว้นจังหวะ) = เดินแบบคน ไม่พุ่ง
-            if key:
-                hold = config.STEP_HOLD_NEAR if near else config.STEP_HOLD
-                self._tap(key, hold)
-                time.sleep(config.STEP_GAP)
-            else:
-                time.sleep(0.03)
+                    if picked is None:
+                        miss += 1
+                        if miss >= config.SEEK_LOST_MISS:
+                            return   # หลุดเป้าจริง (ไม่เจอต่อเนื่องนานเกินไป) -> เลิกไล่
+                        # หลุดแค่ชั่วคราว -> ยังไม่รู้ตำแหน่งใหม่ -> หยุดเดินรอก่อน
+                        # (ไม่เดินมั่ว) จนกว่าจะตรวจเจอเป้าอีกครั้ง
+                        move_key = None
+                    else:
+                        miss = 0
+                        target = picked
+                        self._set_locked(target)
+                        tx, ty, tw, th = target
+                        cx = tx + tw // 2
+                        cy = ty + th // 2 + int(tw * config.SEEK_BODY_DY)
+                        dx, dy = cx - px, cy - py
+                        near = max(abs(dx), abs(dy)) < config.SEEK_NEAR_DIST
 
-    def _end_normal(self):
-        """เจอตัวธรรมดา -> ไม่จับ, นับ +1, เดินออกไปหาตัวต่อไป (ข้าม engage ชั่วคราว)"""
+                        if abs(dx) > config.SEEK_DEADZONE:
+                            # ยังไม่เล็งตรง -> หันกล้องเข้าหาเป้าหมายก่อน (ไม่เดินเฟรมนี้
+                            # กันเดินเบี้ยวระหว่างกล้องกำลังหมุน)
+                            turn = dx * SEEK_TURN_GAIN
+                            turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
+                            self._turn_camera(turn)
+                            move_key = None
+                        else:
+                            move_key = "w"     # เล็งตรงเป้าหมายแล้ว -> ก้าวเดินเข้าหา
+
+                # ก้าวทีละสเต็ป (แตะปุ่มค้าง STEP_HOLD วิ แล้วปล่อย + เว้นจังหวะ)
+                # = เดินแบบคน ไม่พุ่งรวด แต่สเต็ปยาวกว่าค่าตั้งต้นเดิม ไปได้ไกลขึ้นต่อก้าว
+                if move_key:
+                    hold = config.STEP_HOLD_NEAR if near else config.STEP_HOLD
+                    self._tap(move_key, hold)
+                    time.sleep(config.STEP_GAP)
+                else:
+                    time.sleep(0.03)
+        finally:
+            self._set_locked(None)
+
+    def _end_engage(self):
+        """จบ engage ปกติ (เกม auto catch เก็บให้แล้ว) -> นับ +1 แล้วเดินหาตัวต่อไป"""
         self.catch_count += 1
         self.emit("catch", self.catch_count)
         self._skip_engage_until = time.time() + config.SKIP_AFTER_NORMAL
-        self.log("[•] ตัวธรรมดา -> ไม่จับ, เดินหาตัวต่อไป")
+        self.log("[•] จบ engage (Auto Catch เก็บให้แล้ว) -> เดินหาตัวต่อไป")
 
-    # ---------- จัดการ "สู้" (ไม่จับ; หยุดเฉพาะ shiny/prismatic) ----------
-    def _fight_and_catch(self):
+    # ---------- จัดการตอน "เข้าสู้/หน้า Catch": ไม่กดสกิล ไม่กด E เอง ----------
+    def _handle_engage(self):
         """
-        - อยู่ใน battle (TIME) -> วนกดสกิลซ้ำจนกว่าจะขึ้นหน้า Catch
-        - หน้า Catch ตัวธรรมดา -> ไม่จับ (ไม่กด E) เดินหาตัวต่อไป
-        - เจอ shiny/prismatic -> หยุดทันที + แจ้งเตือน (ให้ผู้เล่นจัดการเอง)
-        ตรวจมาจากเธรด detector (เฟรมใหม่เท่านั้น) ส่วนการกดสกิลเดินตามเวลาเอง
+        เกมมี Auto Skill / Auto Catch อยู่แล้ว -> บอทแค่ "รอ" เฉยๆ ไม่ยุ่งกับ
+        การสู้/การจับ หน้าที่บอทตรงนี้มีแค่:
+          - คอย OCR อ่านแผง Obtain Rate เผื่อเจอ shiny/prismatic -> หยุดทันที
+            + แจ้งเตือน ให้ผู้เล่นมาจัดการเอง (จุดนี้ห้ามให้เกม auto จับไปเฉยๆ)
+          - พอพ้นสถานะ battle/catch แล้ว (เกมสู้/จับเสร็จ) -> เดินหาตัวต่อไป
+        ตรวจสถานะจากเธรด detector (เฟรมใหม่เท่านั้น) บอทไม่กดปุ่มอะไรเลยระหว่างนี้
         """
-        s = self.settings
         self.emit("state", "BATTLE")
-        self.log(f"[BATTLE] สู้ -> วนสกิล {s.primary_skill}"
-                 + (" +4" if s.use_skill4 else ""))
-        last_skill = 0.0
+        self.log("[BATTLE] เจอมอน -> รอ Auto Skill/Auto Catch ในเกมจัดการเอง")
         last_event = time.time()
         last_ts = 0.0
         special_count = 0
-        catch_since = 0.0        # เริ่มเห็นหน้า Catch เมื่อไร (ไว้ timeout เป็นธรรมดา)
-        mode = "battle"          # battle / wait / idle
-        hard_end = time.time() + config.FIGHT_HARD_CAP
+        hard_cap = time.time() + config.FIGHT_HARD_CAP
 
-        while time.time() < hard_end:
+        while time.time() < hard_cap:
             self._guard()
             now = time.time()
             p = self._snap()
@@ -507,12 +624,11 @@ class Bot:
             if p["ts"] != last_ts:
                 last_ts = p["ts"]
                 status = p["obtain"]
-                catch_btn = p["catch"]
 
                 special = status in ("shiny", "prismatic")
                 if status == "prismatic" and not config.STOP_ON_PRISMATIC:
                     special = False
-                    status = "normal"
+
                 if special:
                     special_count += 1
                     last_event = now
@@ -531,41 +647,20 @@ class Bot:
                 else:
                     special_count = 0
 
-                if status == "normal":
-                    self._end_normal()      # ตัวธรรมดาชัดเจน -> ไปต่อ
-                    return
-                elif p["in_battle"]:
-                    mode = "battle"
+                if p["engaged"]:
                     last_event = now
-                    catch_since = 0.0
-                elif catch_btn:
-                    mode = "wait"           # หน้า Catch แต่ยังอ่านแผงไม่ชัด -> รอ
-                    last_event = now
-                    if catch_since == 0.0:
-                        catch_since = now
+                    self.emit("state", "CATCH" if p["catch"] else "BATTLE")
                 else:
-                    mode = "idle"
-
-            # ---- ลงมือ (เดินตามเวลาเอง ไม่รอตรวจภาพ) ----
-            if mode == "battle":
-                self.emit("state", "BATTLE")
-                if now - last_skill >= s.skill_interval:
-                    self._press(s.primary_skill)
-                    if s.use_skill4:
-                        self._press("4")
-                    last_skill = now
-            elif mode == "wait":
-                self.emit("state", "CATCH")
-                # อยู่หน้า Catch นานเกินไปแต่อ่านแผงไม่ออก -> ถือว่าธรรมดา ไปต่อ
-                if catch_since and now - catch_since > config.CATCH_SCREEN_TIMEOUT:
-                    self._end_normal()
+                    # พ้นสถานะ engaged แล้ว -> เกม auto skill/auto catch จัดการจบแล้ว
+                    self._end_engage()
                     return
-            else:
-                if now - last_event > config.FIGHT_IDLE_END:
-                    break
+
+            # ไม่มีเฟรมใหม่นานเกินไป -> เผื่อเกมค้าง/หลุดสถานะ ตัดจบไปหาตัวต่อไป
+            if now - last_event > config.FIGHT_IDLE_END:
+                break
             time.sleep(0.05)
 
-        self.log("[BATTLE] จบ -> หาตัวต่อไป")
+        self.log("[BATTLE] เกิน timeout -> หาตัวต่อไป")
 
 
 class _Stop(Exception):

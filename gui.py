@@ -33,6 +33,81 @@ PURPLE = "#b18aff"
 BLUE = "#4f8df7"
 SUB = "#8b93a7"
 
+OVERLAY_TRANS = "#010203"     # สีที่ถูกทำให้โปร่งใส (อย่าใช้สีนี้วาดกรอบ)
+
+
+class Overlay:
+    """หน้าต่างโปร่งใสคลุมจอ ตีกรอบว่าบอทจับตัวเรา/มอนอยู่ตรงไหน
+    ถูกซ่อนจากการแคปจอของบอทด้วย WDA_EXCLUDEFROMCAPTURE (กรอบไม่รบกวนการตรวจ)"""
+
+    def __init__(self, master):
+        self.top = tk.Toplevel(master)
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        self.top.config(bg=OVERLAY_TRANS)
+        try:
+            self.top.attributes("-transparentcolor", OVERLAY_TRANS)
+        except tk.TclError:
+            pass
+        sw, sh = self.top.winfo_screenwidth(), self.top.winfo_screenheight()
+        self.top.geometry(f"{sw}x{sh}+0+0")
+        self.canvas = tk.Canvas(self.top, bg=OVERLAY_TRANS, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.top.update_idletasks()
+        self.capture_safe = self._exclude_from_capture()
+        self.visible = False
+        self.top.withdraw()
+
+    def _exclude_from_capture(self):
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetAncestor(self.canvas.winfo_id(), 2)
+            return bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11))
+        except Exception:
+            return False
+
+    def update_boxes(self, p):
+        self.canvas.delete("all")
+        drew = False
+        if p:
+            pb = p.get("player_box")
+            ax = ay = None                     # จุดยึดตัวเอง (ไว้ลากเส้นไปหามอน)
+            if pb:
+                x, y, w, h = pb
+                self.canvas.create_rectangle(x - 4, y - 4, x + w + 4, y + h + 4,
+                                             outline="#00e05a", width=2)
+                self.canvas.create_text(x, y - 12, text="ตัวเรา ✓", fill="#00e05a",
+                                        anchor="w", font=("Segoe UI", 11, "bold"))
+                ax = x + w // 2
+                ay = y + h // 2 + int(w * config.PLAYER_BODY_DY)
+                drew = True
+            lb = p.get("lv_box")
+            if lb and p.get("lv_score", 0) >= config.MONSTER_THRESHOLD:
+                x, y, w, h = lb
+                cx = x + w // 2
+                cy = y + h // 2 + int(w * config.SEEK_BODY_DY)
+                self.canvas.create_rectangle(x - 4, y - 4, x + w + 4, y + h + 4,
+                                             outline="#ffc832", width=2)
+                self.canvas.create_text(x, y - 12, text="มอน", fill="#ffc832",
+                                        anchor="w", font=("Segoe UI", 11, "bold"))
+                if ax is not None:             # เส้นทิศที่บอทกำลังเดิน
+                    self.canvas.create_line(ax, ay, cx, cy, fill="#00e05a",
+                                            width=1, dash=(6, 4))
+                drew = True
+        if drew and not self.visible:
+            self.top.deiconify()
+            self.visible = True
+        elif not drew and self.visible:
+            self.top.withdraw()
+            self.visible = False
+
+    def hide(self):
+        self.canvas.delete("all")
+        if self.visible:
+            self.top.withdraw()
+            self.visible = False
+
+
 STATE_TH = {
     "STOPPED": ("หยุดอยู่", SUB),
     "RUNNING": ("เริ่มแล้ว", GREEN),
@@ -89,8 +164,10 @@ class App:
 
         self._build()
         self._refresh_history()
+        self.overlay = Overlay(root)
         self.root.after(80, self._poll)
         self.root.after(200, self._check_roblox)
+        self.root.after(300, self._tick_overlay)
 
     # ================= layout =================
     def _build(self):
@@ -183,24 +260,6 @@ class App:
         return c
 
     def _build_settings(self, p):
-        # --- สกิล ---
-        sk = self._card(p, "สกิล")
-        row = ctk.CTkFrame(sk, fg_color="transparent")
-        row.pack(anchor="w", padx=14, pady=(2, 6))
-        ctk.CTkLabel(row, text="สกิลหลักที่วนกด:", font=self.f_body).pack(side="left",
-                                                                          padx=(0, 10))
-        self.seg_skill = ctk.CTkSegmentedButton(row, values=["1", "2", "3"],
-                                                font=self.f_body,
-                                                command=lambda _: self.on_settings())
-        self.seg_skill.set(self.bot.settings.primary_skill)
-        self.seg_skill.pack(side="left")
-
-        self.sw_s4 = ctk.CTkSwitch(sk, text="กดสกิล 4 อัตโนมัติด้วย (เมื่อพร้อม)",
-                                   font=self.f_body, command=self.on_settings)
-        if self.bot.settings.use_skill4:
-            self.sw_s4.select()
-        self.sw_s4.pack(anchor="w", padx=14, pady=(2, 12))
-
         # --- กล้อง & หน้าต่าง ---
         cam = self._card(p, "กล้อง & หน้าต่าง")
         self.sw_cam = ctk.CTkSwitch(cam, text="ตั้งมุมกล้องอัตโนมัติ + ล็อกมุม (ตัวอยู่กลางจอ)",
@@ -218,6 +277,15 @@ class App:
                       border_color=BLUE, text_color=BLUE,
                       hover_color=("gray80", "gray25"),
                       command=self.on_camera).pack(anchor="w", padx=14, pady=(8, 12))
+
+        # --- overlay ---
+        ov = self._card(p, "กรอบบนจอ (Overlay)")
+        self.sw_overlay = ctk.CTkSwitch(
+            ov, text="ตีกรอบบนจอ: ตัวเรา (เขียว) / มอนเป้าหมาย (เหลือง) ให้เห็นว่าบอทจับอยู่",
+            font=self.f_body)
+        if config.OVERLAY_DEFAULT:
+            self.sw_overlay.select()
+        self.sw_overlay.pack(anchor="w", padx=14, pady=(2, 12))
 
         # --- วิธีทำงาน ---
         info = self._card(p, "บอททำอะไรให้บ้าง")
@@ -239,8 +307,6 @@ class App:
     # ================= actions =================
     def on_settings(self):
         s = self.bot.settings
-        s.primary_skill = self.seg_skill.get()
-        s.use_skill4 = bool(self.sw_s4.get())
         s.camera_on_start = bool(self.sw_cam.get())
         s.force_focus = bool(self.sw_focus.get())
 
@@ -330,6 +396,18 @@ class App:
         self.log.configure(state="disabled")
 
     # ================= polling =================
+    def _tick_overlay(self):
+        try:
+            if self.running and self.sw_overlay.get():
+                p = self.bot._snap()
+                fresh = p["ts"] and (time.time() - p["ts"] < 2.0)
+                self.overlay.update_boxes(p if fresh else None)
+            else:
+                self.overlay.hide()
+        except Exception:
+            pass
+        self.root.after(150, self._tick_overlay)
+
     def _check_roblox(self):
         try:
             if roblox.is_running(config.ROBLOX_PROCESS):
