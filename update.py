@@ -23,7 +23,7 @@ import urllib.request
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-REPO = "OWNER/REPO"          # <-- แก้เป็น repo ของคุณ เช่น "Nut15nk/evomon-hunter"
+REPO = "Nut15nk/evomon-hunter"
 BRANCH = "main"
 TIMEOUT = 6                  # วินาที — เน็ตช้า/ออฟไลน์ = ยอมแพ้เร็วๆ ไม่ให้บอทเปิดช้า
 
