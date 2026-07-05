@@ -118,6 +118,55 @@ def whiteness(img):
     return cv2.min(cv2.min(b, g), r)
 
 
+# ---------- ตรวจ "สีพื้นหลังป้าย Lv." เพิ่มอีกชั้น (กันจับ L/ตัวหนังสือขาวที่อื่นผิด) ----------
+# แค่ whiteness อย่างเดียวจับได้แค่ "รูปร่างตัวอักษรขาว" -- ข้อความขาวอื่นบนจอ (เช่น
+# แชท/ป้ายชื่อคนอื่น/ตัวหนังสือ UI ที่ไม่เกี่ยวกับมอน) ก็ดันคะแนนสูงได้เหมือนกันถ้า
+# รูปร่างคล้ายกันบังเอิญ -- ป้าย Lv. จริงมักมีพื้นหลังมีสี (ไม่ใช่ขาว/เทาล้วน) รอบตัวอักษร
+# เลยเช็คเพิ่มว่า "สัดส่วนพิกเซลมีสี" ในกรอบที่จับได้ ใกล้เคียงกับ template จริงไหม
+# (self-calibrate จาก template ที่โหลดมาเอง ไม่ต้อง hardcode สีตายตัว เผื่อคนละธีม/สกิน)
+_tpl_color_frac_cache = {}
+
+
+def _colorfulness_frac(img_bgr, sat_min=50, val_min=50):
+    """สัดส่วนพิกเซลที่ 'มีสีจริง' (ไม่ใช่ขาว/เทา/ดำ) ในภาพ -- ยิ่งสูงยิ่งมีพื้นหลังสีเยอะ"""
+    if img_bgr is None or img_bgr.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    sat, val = hsv[:, 1], hsv[:, 2]
+    colored = (sat > sat_min) & (val > val_min)
+    return float(colored.mean()) if colored.size else 0.0
+
+
+def _tpl_color_frac(tpl):
+    """สัดส่วนสีของ template จริง (แคชไว้กันคำนวณซ้ำทุกเฟรม เพราะ template ไม่เปลี่ยน)"""
+    key = id(tpl)
+    frac = _tpl_color_frac_cache.get(key)
+    if frac is None:
+        frac = _colorfulness_frac(tpl)
+        _tpl_color_frac_cache[key] = frac
+    return frac
+
+
+def _color_confirm(frame, box, tpl):
+    """เช็คว่ากรอบที่จับได้บนเฟรมจริง มีสีพื้นหลังใกล้เคียง template ป้าย Lv. หรือไม่
+    ใช้กรองข้อความขาวอื่นบนจอที่ไม่ใช่ป้าย Lv. จริง (ไม่มีพื้นสี) ออก
+    ปิดใช้งานได้ด้วย config.LV_COLOR_CHECK = False ถ้าเจอปัญหา (fallback ปลอดภัย)"""
+    if not getattr(config, "LV_COLOR_CHECK", True):
+        return True
+    tpl_frac = _tpl_color_frac(tpl)
+    # template เองก็ไม่ค่อยมีสี (เช่นพื้นหลังโปร่งใส/ขาวเกือบหมด) -- เช็คนี้ไม่มีประโยชน์ ข้ามไป
+    if tpl_frac < 0.05:
+        return True
+    x, y, w, h = box
+    x0, y0 = max(int(x), 0), max(int(y), 0)
+    x1, y1 = min(int(x + w), frame.shape[1]), min(int(y + h), frame.shape[0])
+    if x1 <= x0 or y1 <= y0:
+        return False
+    crop_frac = _colorfulness_frac(frame[y0:y1, x0:x1])
+    min_ratio = getattr(config, "LV_COLOR_MIN_RATIO", 0.35)
+    return crop_frac >= tpl_frac * min_ratio
+
+
 # ---------- หาป้าย Lv. แบบหลายสเกล (เน้นตัวอักษรขาว ตัดพื้นส้มทิ้ง) ----------
 # รับ template ตัวเดียวหรือเป็น list (เรียนเพิ่มได้จาก templates/lv/ ด้วย learn_mobs.py)
 def locate_lv(frame, lv_templates):
@@ -140,16 +189,21 @@ def locate_lv(frame, lv_templates):
             continue
         wt = whiteness(tpl)
         th0, tw0 = wt.shape[:2]
+        tpl_best = (0.0, None, 1.0)
         for scale in config.LV_SCALES:
             tw, th = int(tw0 * scale * ds), int(th0 * scale * ds)
             if tw < 8 or th < 8 or tw > wf.shape[1] or th > wf.shape[0]:
                 continue
             t = cv2.resize(wt, (tw, th))
             _, mv, _, ml = _match_minmax(wf_u, t)
-            if mv > best[0]:
+            if mv > tpl_best[0]:
                 # แปลงพิกัด/ขนาดกลับเป็นสเกลเต็ม (เผื่อ ds < 1.0)
                 box = (int(ml[0] / ds), int(ml[1] / ds), int(tw / ds), int(th / ds))
-                best = (mv, box, scale)
+                tpl_best = (mv, box, scale)
+        # เช็คสีพื้นหลังก่อนรับ -- กันจับข้อความขาวอื่นที่ไม่ใช่ป้าย Lv. จริง (ไม่มีพื้นสี)
+        if tpl_best[1] is not None and tpl_best[0] > best[0] and \
+                _color_confirm(frame, tpl_best[1], tpl):
+            best = tpl_best
         # เจอชัดแล้ว -> ไม่ต้องลอง template ที่เหลือ (ประหยัดเวลาต่อเฟรมมาก)
         if best[0] >= config.LV_EARLY_EXIT:
             break
@@ -159,15 +213,16 @@ def locate_lv(frame, lv_templates):
 # ---------- กันกล่องซ้อนทับ (non-max suppression) แบบง่าย ----------
 # ใช้ IoU (intersection-over-union) ตัดกล่องที่ทับกันมาก เหลือแค่คะแนนสูงสุดในกลุ่ม
 def _nms(candidates, iou_thresh=0.3):
-    # candidates: list ของ (score, (x,y,w,h))
+    # candidates: list ของ (score, (x,y,w,h), ...ข้อมูลเพิ่มเติมถ้ามี)
     candidates = sorted(candidates, key=lambda c: c[0], reverse=True)
     kept = []
-    for score, box in candidates:
+    for cand in candidates:
+        score, box = cand[0], cand[1]
         x0, y0, w0, h0 = box
         a0 = w0 * h0
         overlap = False
-        for _, kbox in kept:
-            x1, y1, w1, h1 = kbox
+        for kcand in kept:
+            x1, y1, w1, h1 = kcand[1]
             ix0, iy0 = max(x0, x1), max(y0, y1)
             ix1, iy1 = min(x0 + w0, x1 + w1), min(y0 + h0, y1 + h1)
             iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
@@ -180,7 +235,7 @@ def _nms(candidates, iou_thresh=0.3):
                 overlap = True
                 break
         if not overlap:
-            kept.append((score, box))
+            kept.append(cand)
     return kept
 
 
@@ -200,7 +255,7 @@ def locate_lv_multi(frame, lv_templates, threshold=None):
     wf = whiteness(search)
     wf_u = _um(wf)
 
-    candidates = []   # (score, (x,y,w,h)) พิกัด/ขนาดสเกลเต็มเสมอ
+    candidates = []   # (score, (x,y,w,h), tpl) พิกัด/ขนาดสเกลเต็มเสมอ -- tpl เก็บไว้เช็คสีทีหลัง
     for tpl in lv_templates:
         if tpl is None:
             continue
@@ -216,7 +271,7 @@ def locate_lv_multi(frame, lv_templates, threshold=None):
             for x, y in zip(xs, ys):
                 score = float(res[y, x])
                 box = (int(x / ds), int(y / ds), int(tw / ds), int(th / ds))
-                candidates.append((score, box))
+                candidates.append((score, box, tpl))
 
     if not candidates:
         return []
@@ -225,11 +280,14 @@ def locate_lv_multi(frame, lv_templates, threshold=None):
     candidates.sort(key=lambda c: c[0], reverse=True)
     candidates = candidates[:200]
 
-    targets = _nms(candidates, iou_thresh=0.3)
-    targets.sort(key=lambda c: c[0], reverse=True)
+    kept = _nms(candidates, iou_thresh=0.3)
+    # เช็คสีพื้นหลังก่อนยืนยันเป็นเป้าจริง -- กันข้อความขาวอื่นบนจอ (ไม่มีพื้นสี)
+    # หลุดมาปนเป็น "เป้าหมาย" ที่บอทจะล็อกไล่ตาม
+    confirmed = [(sc, box) for sc, box, tpl in kept if _color_confirm(frame, box, tpl)]
+    confirmed.sort(key=lambda c: c[0], reverse=True)
 
     max_targets = getattr(config, "MAX_TARGETS", 6)
-    return targets[:max_targets]
+    return confirmed[:max_targets]
 
 
 # ---------- หาป้ายชื่อผู้เล่น (anchor ตำแหน่งตัวเอง) ----------
