@@ -8,6 +8,7 @@
 
 import os
 import json
+import threading
 import concurrent.futures
 
 import cv2
@@ -61,8 +62,11 @@ def gpu_status_text():
 
 def _um(a):
     """ห่อภาพเป็น UMat เพื่อให้ opencv ส่งไปรันบน GPU ผ่าน OpenCL อัตโนมัติ
-    (เฉพาะตอน GPU_ENABLED เท่านั้น ไม่งั้นคืนของเดิมเป็น numpy array ปกติ)"""
+    (เฉพาะตอน GPU_ENABLED เท่านั้น ไม่งั้นคืนของเดิมเป็น numpy array ปกติ)
+    ถ้าเป็น UMat อยู่แล้วคืนตัวเดิมเลย -- กัน upload ซ้ำเวลาเรียกซ้ำในลูปสเกล"""
     if GPU_ENABLED:
+        if isinstance(a, cv2.UMat):
+            return a
         try:
             return cv2.UMat(a)
         except Exception:
@@ -75,6 +79,37 @@ def _to_np(a):
     if isinstance(a, cv2.UMat):
         return a.get()
     return a
+
+
+# detect_all() ยิง locate_lv / locate_lv_multi / locate_player / best_score
+# พร้อมกันคนละเธรด (ThreadPoolExecutor) -- แต่ cv2.UMat/OpenCL "ไม่ปลอดภัย" ที่จะ
+# ให้หลายเธรดยิงเข้า GPU queue เดียวกันพร้อมกัน (ผลลัพธ์เพี้ยน/throw exception ได้
+# ซึ่งถ้าไม่ดักไว้จะทำให้ detect_all() ทั้งก้อน error แล้วเธรดตรวจจับตายทั้งเธรด
+# = ไม่สแกน LV ต่อเลย) -- ใช้ lock ตัวเดียวคั่นเฉพาะช่วง matchTemplate บน GPU
+# กันชนกัน ส่วนพาธ CPU (ไม่มี lock) ยังรันขนานกันได้เต็มที่เหมือนเดิม
+_gpu_lock = threading.Lock()
+
+
+def _match_minmax(a, b):
+    """matchTemplate + minMaxLoc เป็นก้อนเดียว ปลอดภัยเมื่อรันพร้อมกันหลายเธรด
+    (ทั้ง matchTemplate และ minMaxLoc คุยกับ GPU queue เดียวกัน ต้อง lock คู่กัน
+    ไม่งั้นชนกันได้ถ้าอีกเธรดแทรกเข้ามาระหว่างสองคำสั่งนี้)"""
+    if GPU_ENABLED:
+        with _gpu_lock:
+            res = cv2.matchTemplate(_um(a), _um(b), cv2.TM_CCOEFF_NORMED)
+            return cv2.minMaxLoc(res)
+    res = cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)
+    return cv2.minMaxLoc(res)
+
+
+def _match_array(a, b):
+    """matchTemplate แล้วคืนเป็น numpy array เต็มตาราง (ปลอดภัยเมื่อรันพร้อมกันหลายเธรด)
+    ใช้ตอนต้องอ่านทุกจุดที่ผ่าน threshold (เช่น locate_lv_multi) ไม่ใช่แค่จุดที่ดีที่สุด"""
+    if GPU_ENABLED:
+        with _gpu_lock:
+            res = cv2.matchTemplate(_um(a), _um(b), cv2.TM_CCOEFF_NORMED)
+            return _to_np(res)
+    return cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)
 
 
 # ---------- "ความขาว" ของพิกเซล (ตัวอักษร Lv สีขาว = สูง, พื้นส้ม = ต่ำ) ----------
@@ -110,8 +145,7 @@ def locate_lv(frame, lv_templates):
             if tw < 8 or th < 8 or tw > wf.shape[1] or th > wf.shape[0]:
                 continue
             t = cv2.resize(wt, (tw, th))
-            res = cv2.matchTemplate(wf_u, _um(t), cv2.TM_CCOEFF_NORMED)
-            _, mv, _, ml = cv2.minMaxLoc(res)
+            _, mv, _, ml = _match_minmax(wf_u, t)
             if mv > best[0]:
                 # แปลงพิกัด/ขนาดกลับเป็นสเกลเต็ม (เผื่อ ds < 1.0)
                 box = (int(ml[0] / ds), int(ml[1] / ds), int(tw / ds), int(th / ds))
@@ -177,7 +211,7 @@ def locate_lv_multi(frame, lv_templates, threshold=None):
             if tw < 8 or th < 8 or tw > wf.shape[1] or th > wf.shape[0]:
                 continue
             t = cv2.resize(wt, (tw, th))
-            res = _to_np(cv2.matchTemplate(wf_u, _um(t), cv2.TM_CCOEFF_NORMED))
+            res = _match_array(wf_u, t)
             ys, xs = np.where(res >= thresh)
             for x, y in zip(xs, ys):
                 score = float(res[y, x])
@@ -224,8 +258,7 @@ def locate_player(frame, tpl):
         if tw < 8 or th < 8 or tw > wf.shape[1] or th > wf.shape[0]:
             continue
         t = cv2.resize(wt, (tw, th))
-        res = cv2.matchTemplate(wf_u, _um(t), cv2.TM_CCOEFF_NORMED)
-        _, mv, _, ml = cv2.minMaxLoc(res)
+        _, mv, _, ml = _match_minmax(wf_u, t)
         if mv > best[0]:
             # แปลงพิกัด/ขนาดกลับเป็นสเกลเต็ม (เผื่อ ds < 1.0) แล้วบวก offset ของ sub กลับ
             bx = x0 + int(ml[0] / ds)
@@ -251,8 +284,7 @@ def best_score(frame, template, scales):
         if tw < 8 or th < 8 or tw > gf.shape[1] or th > gf.shape[0]:
             continue
         t = cv2.resize(gt, (tw, th))
-        res = cv2.matchTemplate(gf_u, _um(t), cv2.TM_CCOEFF_NORMED)
-        _, mv, _, _ = cv2.minMaxLoc(res)
+        _, mv, _, _ = _match_minmax(gf_u, t)
         if mv > best:
             best = mv
     return best

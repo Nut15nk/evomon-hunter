@@ -75,6 +75,13 @@ class Bot:
         self._rbx_ok = False
         self._rbx_last = 0.0
         self._skip_engage_until = 0.0  # หลังเจอตัว/จบ engage ข้าม engage ชั่วคราว (เดินออกไปหาตัวใหม่)
+        # ---- กันสัญญาณ "engaged" กระพริบ (false positive เฟรมเดียว/สองเฟรม) ----
+        # ต้องเจอ/ไม่เจอต่อเนื่องกี่เฟรมถึงจะเชื่อ ไม่งั้นเดี๋ยว BATTLE เดี๋ยวจบสลับถี่ๆ
+        # จนไม่ได้เดินหามอนเลยสักที (ดู config.ENGAGE_CONFIRM)
+        self._engaged_streak = 0
+        self._disengaged_streak = 0
+        self._engaged_latched = False
+        self._logged_engage_scores = False   # log คะแนนตอนเข้า engage แค่ครั้งแรกของรอบ กันสแปม
         # ---- ผลตรวจภาพล่าสุด (เธรด detector เขียน, เธรด control อ่าน) ----
         self._plock = threading.Lock()
         self._percept = self._blank_percept()
@@ -158,6 +165,10 @@ class Bot:
         self._running.set()
         with self._plock:
             self._percept = self._blank_percept()
+        self._engaged_streak = 0
+        self._disengaged_streak = 0
+        self._engaged_latched = False
+        self._logged_engage_scores = False
         # อุ่นเครื่อง OCR ล่วงหน้า (โหลดโมเดลครั้งแรกช้า) ไม่ให้สะดุดตอนถึงหน้า Catch
         threading.Thread(target=ocr.warmup, daemon=True).start()
         # เธรดตรวจภาพ: แคปจอ+ตรวจภาพวนที่ config.DETECT_FPS (ดีฟอลต์ 10 ครั้ง/วิ) อยู่เบื้องหลัง
@@ -347,17 +358,51 @@ class Bot:
 
             H, W = frame.shape[:2]
             # ยิงตรวจจับ Lv./ผู้เล่น/battle/panel พร้อมกันในเฟรมเดียว (multi-thread)
-            res = vision.detect_all(
-                frame, self.lv_tpl, self.player_tpl,
-                self.battle_tpl, self.panel_tpl,
-                config.BATTLE_SCALES, config.PANEL_SCALES,
-                need_target=not prev_engaged,
-            )
+            try:
+                res = vision.detect_all(
+                    frame, self.lv_tpl, self.player_tpl,
+                    self.battle_tpl, self.panel_tpl,
+                    config.BATTLE_SCALES, config.PANEL_SCALES,
+                    need_target=not prev_engaged,
+                )
+            except Exception as e:
+                # กันเฟรมพังเฟรมเดียวลากทั้งเธรดตรวจจับตายไปตลอด (ไม่งั้น percept
+                # จะแช่ค้างที่ค่าเก่าตลอดไป = ไม่สแกน/ไม่อัปเดต overlay อีกเลย)
+                self.log(f"[!] Detect error (ข้ามเฟรมนี้): {e}")
+                time.sleep(0.05)
+                continue
             in_b = res["battle_score"] >= config.BATTLE_THRESHOLD
             catch = res["panel_score"] >= config.PANEL_THRESHOLD
             # OCR แผง shiny/prismatic เฉพาะตอนอยู่หน้า Catch (rec-only เร็ว ~200ms)
             obtain = ocr.read_obtain(frame) if catch else None
-            engaged = in_b or catch or bool(obtain)
+            raw_engaged = in_b or catch or bool(obtain)
+
+            # ---- debounce กันสัญญาณ engaged กระพริบ (false positive 1-2 เฟรม) ----
+            # ต้องเจอ/หายต่อเนื่องครบ ENGAGE_CONFIRM เฟรมก่อนถึงจะเชื่อว่าเปลี่ยนสถานะ
+            # จริง ไม่งั้น battle_score/panel_score ที่ก้ำกึ่ง threshold จะทำให้เข้า/
+            # ออก BATTLE รัวๆ ทุกเฟรม จนไม่ได้เดินหามอนสักที (ตามที่เจอปัญหา)
+            confirm = max(1, getattr(config, "ENGAGE_CONFIRM", 2))
+            if raw_engaged:
+                self._engaged_streak += 1
+                self._disengaged_streak = 0
+            else:
+                self._disengaged_streak += 1
+                self._engaged_streak = 0
+            if self._engaged_streak >= confirm and not self._engaged_latched:
+                self._engaged_latched = True
+                self._logged_engage_scores = False   # เพิ่งเข้า engage รอบใหม่ -> log คะแนนได้อีกที
+            elif self._disengaged_streak >= confirm and self._engaged_latched:
+                self._engaged_latched = False
+            engaged = self._engaged_latched
+
+            # log คะแนนดิบตอนเริ่มเข้า engage (ครั้งแรกของรอบเท่านั้น กันสแปม) --
+            # ไว้เช็คว่า trigger เพราะเจอมอนจริงหรือ false positive (คะแนนก้ำกึ่ง threshold)
+            if engaged and not self._logged_engage_scores:
+                self._logged_engage_scores = True
+                self.log(f"[i] engaged: battle={res['battle_score']:.2f}"
+                         f"(>= {config.BATTLE_THRESHOLD}) panel={res['panel_score']:.2f}"
+                         f"(>= {config.PANEL_THRESHOLD}) obtain={obtain}")
+
             prev_engaged = engaged
 
             lv_score, lv_box = res["lv_score"], res["lv_box"]
@@ -472,12 +517,11 @@ class Bot:
             self._seek_and_engage()
             return 0
 
-        # ไม่เจอ Lv. (หรือช่วง cooldown) -> หมุนกล้องกวาดหา จนกว่าจะเจอ
+        # ไม่เจอ Lv. (หรือช่วง cooldown) -> หมุนกล้องกวาดหาอย่างเดียว จนกว่าจะเจอ
+        # (ไม่เดินระหว่างหา กันปัญหาเดินค้าง/เดินมั่วตอนยังไม่เห็นมอน)
         self.emit("state", "SEARCH")
         empty += 1
-        self._scan_yaw(1)                           # หมุนกล้องหา Lv.
-        if empty % config.SCAN_WALK_EVERY == 0:      # เดินหน้านิดๆ เป็นพักๆ
-            self._tap(config.SCAN_MOVE_KEY, config.SCAN_MOVE_DUR)
+        self._scan_yaw(1)                           # หมุนกล้องหา Lv. (แนวนอน/yaw เท่านั้น)
         return empty
 
     # ---------- เดินเข้าหามอนตามตำแหน่งที่ตรวจ (overlay) ชี้ไว้ ----------
@@ -501,6 +545,12 @@ class Bot:
         move_key = None
         near = False
         target = None    # (x,y,w,h) กล่องมอนที่ล็อกไว้ -- อัปเดตตำแหน่งได้ แต่ไม่สลับตัว
+        # ---- ช่วง "เล็งกล้องก่อน" ตอนเพิ่งล็อกเป้าใหม่: หันกล้องอย่างเดียว
+        # ยังไม่เดิน จนกว่าจะเล็งใกล้เคียงพอ ค่อยเริ่มเดิน (ไม่ใช่เดินตั้งแต่ยัง
+        # เล็งไม่เข้าเป้าเลย) -- มี timeout กันกรณี sensitivity ไม่ตรงจนเล็งไม่เข้า
+        # deadzone สักที ไม่งั้นจะกลายเป็นหมุนค้างไม่เดินสักก้าว
+        aligning = False
+        align_deadline = 0.0
         self._set_locked(None)
         t_end = time.time() + config.SEEK_TIMEOUT
         try:
@@ -562,6 +612,7 @@ class Bot:
                         move_key = None
                     else:
                         miss = 0
+                        just_acquired = (target is None)   # เพิ่งล็อกเป้าตัวนี้เป็นครั้งแรก
                         target = picked
                         self._set_locked(target)
                         tx, ty, tw, th = target
@@ -570,15 +621,34 @@ class Bot:
                         dx, dy = cx - px, cy - py
                         near = max(abs(dx), abs(dy)) < config.SEEK_NEAR_DIST
 
-                        if abs(dx) > config.SEEK_DEADZONE:
-                            # ยังไม่เล็งตรง -> หันกล้องเข้าหาเป้าหมายก่อน (ไม่เดินเฟรมนี้
-                            # กันเดินเบี้ยวระหว่างกล้องกำลังหมุน)
-                            turn = dx * SEEK_TURN_GAIN
-                            turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
-                            self._turn_camera(turn)
-                            move_key = None
-                        else:
-                            move_key = "w"     # เล็งตรงเป้าหมายแล้ว -> ก้าวเดินเข้าหา
+                        if just_acquired:
+                            aligning = True
+                            align_deadline = time.time() + config.SEEK_ALIGN_TIMEOUT
+
+                        # ---- ช่วงเล็งกล้องก่อนเดิน (เฉพาะตอนเพิ่งล็อกเป้าใหม่) ----
+                        # หันกล้องอย่างเดียวจนเล็งใกล้เคียงมอนพอ (เข้า SEEK_ALIGN_DEADZONE)
+                        # แล้วค่อยเริ่มเดิน ถ้าเล็งไม่เข้าทันเวลา (sensitivity ไม่ตรง)
+                        # ก็เลิกรอ เริ่มเดินไปเลยกันหมุนค้าง
+                        if aligning:
+                            if abs(dx) <= config.SEEK_ALIGN_DEADZONE:
+                                aligning = False
+                            elif time.time() >= align_deadline:
+                                aligning = False
+                                self.log("[i] เล็งไม่เข้าทันเวลา -> เริ่มเดินเลย (กันหมุนค้าง)")
+                            else:
+                                turn = dx * SEEK_TURN_GAIN
+                                turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
+                                self._turn_camera(turn)
+                                move_key = None
+
+                        if not aligning:
+                            # หันกล้องปรับทิศต่อไป "พร้อมกับ" เดิน (ละเอียดขึ้นเรื่อยๆ
+                            # ระหว่างเดิน) ไม่ใช่ต้องเล็งตรงเป๊ะทุกเฟรมถึงจะเดิน
+                            if abs(dx) > config.SEEK_DEADZONE:
+                                turn = dx * SEEK_TURN_GAIN
+                                turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
+                                self._turn_camera(turn)
+                            move_key = "w"     # เล็งใกล้เคียงแล้ว -> เดินเข้าหา
 
                 # ก้าวทีละสเต็ป (แตะปุ่มค้าง STEP_HOLD วิ แล้วปล่อย + เว้นจังหวะ)
                 # = เดินแบบคน ไม่พุ่งรวด แต่สเต็ปยาวกว่าค่าตั้งต้นเดิม ไปได้ไกลขึ้นต่อก้าว
