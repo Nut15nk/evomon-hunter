@@ -313,9 +313,9 @@ class Bot:
             dx_pixels = sign * max(abs(dx_pixels), SEEK_TURN_MIN)
         pydirectinput.mouseDown(button="right")
         try:
-            time.sleep(0.015)                # เผื่อเกมรับปุ่มขวาก่อน ค่อยเริ่มลาก
+            time.sleep(0.01)                 # เผื่อเกมรับปุ่มขวาก่อน ค่อยเริ่มลาก
             self._drag(int(dx_pixels), 0)
-            time.sleep(0.015)                # เว้นจังหวะให้เกมประมวลผลลากก่อนปล่อยปุ่ม
+            time.sleep(0.01)                 # เว้นจังหวะให้เกมประมวลผลลากก่อนปล่อยปุ่ม
         finally:
             pydirectinput.mouseUp(button="right")
         time.sleep(SEEK_TURN_SETTLE)         # เว้นจังหวะสั้นๆ ก่อนเดิน/ตรวจเฟรมถัดไป
@@ -558,6 +558,12 @@ class Bot:
         move_key = None
         near = False
         target = None    # (x,y,w,h) กล่องมอนที่ล็อกไว้ -- อัปเดตตำแหน่งได้ แต่ไม่สลับตัว
+        # ---- ช่วง "เล็งกล้องให้เสร็จก่อนค่อยเดิน" (ไม่ใช่เดินไปหันไปพร้อมกัน) ----
+        # ตอนเพิ่งล็อกเป้าใหม่ (หรือเป้าขยับจนหลุด deadzone ไปแล้ว) จะหันกล้องอย่าง
+        # เดียวก่อน ยังไม่เดิน จนกว่าจะเล็งเข้า SEEK_ALIGN_DEADZONE ค่อยเริ่มเดิน
+        # มี timeout กันเคส sensitivity ไม่ตรงจนเล็งไม่เข้าสักที ไม่งั้นจะหมุนค้างไม่เดิน
+        aligning = False
+        align_deadline = 0.0
         self._set_locked(None)
         t_end = time.time() + config.SEEK_TIMEOUT
         try:
@@ -619,6 +625,7 @@ class Bot:
                         move_key = None
                     else:
                         miss = 0
+                        just_acquired = (target is None)   # เพิ่งล็อกเป้าตัวนี้เป็นครั้งแรก
                         target = picked
                         self._set_locked(target)
                         tx, ty, tw, th = target
@@ -627,14 +634,38 @@ class Bot:
                         dx, dy = cx - px, cy - py
                         near = max(abs(dx), abs(dy)) < config.SEEK_NEAR_DIST
 
-                        # หันกล้องปรับทิศ "พร้อมกับ" เดินไปเลยแบบ real-time ไม่ต้องรอ
-                        # เล็งตรงเป๊ะก่อน (ไม่งั้นจะรู้สึกช้า/หน่วง) -- เจอเป้าปุ๊บเดิน
-                        # ปั๊บ กล้องค่อยๆ ขยับตามแม่นขึ้นเรื่อยๆ ระหว่างเดินแทน
-                        if abs(dx) > config.SEEK_DEADZONE:
-                            turn = dx * SEEK_TURN_GAIN
-                            turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
-                            self._turn_camera(turn)
-                        move_key = "w"     # เจอเป้าแล้ว -> เดินเข้าหาเสมอ ไม่ต้องรอเล็งตรง
+                        if just_acquired:
+                            aligning = True
+                            align_deadline = time.time() + config.SEEK_ALIGN_TIMEOUT
+
+                        # ---- เล็งกล้องให้เสร็จก่อน แล้วค่อยเดิน (ไม่ใช่เดินไปหันไป) ----
+                        if aligning:
+                            if abs(dx) <= config.SEEK_ALIGN_DEADZONE:
+                                aligning = False   # เล็งเข้าพอแล้ว -> เริ่มเดินรอบถัดไป
+                                move_key = None
+                            elif time.time() >= align_deadline:
+                                aligning = False
+                                self.log("[i] เล็งไม่เข้าทันเวลา -> เดินไปก่อน (กันหมุนค้าง)")
+                                move_key = None
+                            else:
+                                turn = dx * SEEK_TURN_GAIN
+                                turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
+                                self._turn_camera(turn)
+                                move_key = None   # กำลังเล็งอยู่ -> ยังไม่เดิน
+
+                        if not aligning:
+                            # เดินแล้ว แต่ถ้าเป้าขยับจน dx หลุด deadzone ไปมาก ให้หยุด
+                            # เดินแล้วกลับไปเล็งใหม่ก่อน (ตรงตามที่ขอ: หันให้เสร็จก่อน
+                            # ค่อยเดิน ไม่ใช่เดินไปหันไปพร้อมกัน)
+                            if abs(dx) > config.SEEK_ALIGN_DEADZONE:
+                                aligning = True
+                                align_deadline = time.time() + config.SEEK_ALIGN_TIMEOUT
+                                turn = dx * SEEK_TURN_GAIN
+                                turn = max(-SEEK_TURN_MAX, min(SEEK_TURN_MAX, turn))
+                                self._turn_camera(turn)
+                                move_key = None
+                            else:
+                                move_key = "w"     # เล็งเข้าเป้าอยู่แล้ว -> เดินเข้าหาต่อ
 
                 # ก้าวทีละสเต็ป (แตะปุ่มค้าง STEP_HOLD วิ แล้วปล่อย + เว้นจังหวะ)
                 # = เดินแบบคน ไม่พุ่งรวด แต่สเต็ปยาวกว่าค่าตั้งต้นเดิม ไปได้ไกลขึ้นต่อก้าว
